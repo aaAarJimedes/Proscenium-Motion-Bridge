@@ -11,6 +11,9 @@ def _armature_poll(_self, obj):
 def _invalidate_mapping(self, _context):
     self.mapping_signature = ""
     self.mapping_valid = False
+    self.status_level = "INFO"
+    self.status_code = "MAPPING_STALE"
+    self.next_action = "点击“自动识别并检查”"
     self.status_message = "骨架或位移模式已变化，请重新自动映射"
 
 
@@ -45,7 +48,34 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
         description="在世界空间读取官方骨架的 Hips 位移，兼容对象层变换",
         default=True,
     )
+    accept_preview_on_run: BoolProperty(
+        name="一键时接受当前预览",
+        description="Proscenium 正在预览时，先执行 Accept，再立即重定向到 MMD；Accept 成功后即使重定向失败，生成结果也会保留",
+        default=True,
+    )
+    follow_proscenium_inplace: BoolProperty(
+        name="跟随 Proscenium 原地模式",
+        description="一键输出时根据 Proscenium Preview 的 In-place 开关自动选择完整位移或原地动作",
+        default=True,
+    )
     mapping_valid: BoolProperty(default=False, options={"HIDDEN"})
+    status_level: EnumProperty(
+        items=(
+            ("INFO", "Info", ""),
+            ("READY", "Ready", ""),
+            ("WARNING", "Warning", ""),
+            ("ERROR", "Error", ""),
+            ("BUSY", "Busy", ""),
+        ),
+        default="INFO",
+        options={"HIDDEN"},
+    )
+    status_code: StringProperty(default="NOT_READY", options={"HIDDEN"})
+    next_action: StringProperty(default="先生成官方骨架动作，再选择 MMD 目标", options={"HIDDEN"})
+    source_origin: StringProperty(default="", options={"HIDDEN"})
+    target_origin: StringProperty(default="", options={"HIDDEN"})
+    source_candidates: StringProperty(default="", options={"HIDDEN"})
+    target_candidates: StringProperty(default="", options={"HIDDEN"})
     matched_count: IntProperty(default=0, min=0, options={"HIDDEN"})
     expected_count: IntProperty(default=0, min=0, options={"HIDDEN"})
     critical_missing: StringProperty(default="", options={"HIDDEN"})
@@ -57,6 +87,7 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
     mapping_signature: StringProperty(default="", options={"HIDDEN"})
     bridge_owns_current_table: BoolProperty(default=False, options={"HIDDEN"})
     previous_blendcap_mapping_json: StringProperty(default="", options={"HIDDEN"})
+    previous_blendcap_state_json: StringProperty(default="", options={"HIDDEN"})
     previous_blendcap_source: StringProperty(default="", options={"HIDDEN"})
     previous_blendcap_target: StringProperty(default="", options={"HIDDEN"})
     constraint_snapshot_json: StringProperty(default="", options={"HIDDEN"})

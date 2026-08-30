@@ -1,4 +1,4 @@
-ADDON_VERSION = (0, 1, 0)
+ADDON_VERSION = (0, 2, 0)
 
 TOOL_ID = "ba_motion_bridge"
 TOOL_NAME = "BA Motion Bridge"

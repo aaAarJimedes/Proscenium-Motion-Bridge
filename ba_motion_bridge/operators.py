@@ -101,24 +101,67 @@ def _effective_nla_strips(animation_data) -> list:
 
 
 def _uniform_scale(obj, tolerance: float = 1e-5) -> bool:
-    values = [abs(float(value)) for value in obj.scale]
+    values = [float(value) for value in obj.scale]
+    if min(values) <= 1e-8:
+        return False
+    if float(obj.matrix_world.to_3x3().determinant()) <= 1e-10:
+        return False
     return max(values) - min(values) <= tolerance * max(max(values), 1.0)
 
 
+def _is_mmd_candidate(obj) -> bool:
+    if not _is_armature(obj):
+        return False
+    metadata = 0
+    for bone in obj.data.bones:
+        holders = (bone, obj.pose.bones.get(bone.name))
+        for holder in holders:
+            mmd_bone = getattr(holder, "mmd_bone", None) if holder is not None else None
+            if mmd_bone is None:
+                continue
+            if any(getattr(mmd_bone, attr, "") for attr in ("name_j", "name_e")):
+                metadata += 1
+                break
+    if metadata >= 4:
+        return True
+    names = {bone.name for bone in obj.data.bones}
+    if len({"センター", "下半身", "上半身", "首", "頭"}.intersection(names)) >= 4:
+        return True
+    current = obj
+    seen = set()
+    while current is not None and current.as_pointer() not in seen:
+        seen.add(current.as_pointer())
+        if getattr(current, "mmd_type", "NONE") == "ROOT":
+            return True
+        current = current.parent
+    return False
+
+
 def _auto_source(scene, settings):
+    settings.source_candidates = ""
     if _is_official_source(settings.source_rig):
+        settings.source_origin = "已明确选择"
         return settings.source_rig
 
     proscenium = getattr(scene, "proscenium", None)
     candidate = getattr(proscenium, "target_armature", None) if proscenium else None
     if _is_official_source(candidate):
+        settings.source_origin = "Proscenium 当前骨架"
         return candidate
 
     active = bpy.context.active_object
     if _is_official_source(active):
+        settings.source_origin = "活动对象"
         return active
 
-    return next((obj for obj in scene.objects if _is_official_source(obj)), None)
+    candidates = [obj for obj in scene.objects if _is_official_source(obj)]
+    if len(candidates) == 1:
+        settings.source_origin = "场景唯一官方骨架"
+        return candidates[0]
+    if len(candidates) > 1:
+        settings.source_candidates = "、".join(sorted(obj.name for obj in candidates))
+    settings.source_origin = ""
+    return None
 
 
 def _candidate_result(source, candidate, root_motion_mode: str) -> MappingResult | None:
@@ -132,13 +175,22 @@ def _candidate_result(source, candidate, root_motion_mode: str) -> MappingResult
 
 def _auto_target(scene, settings, source):
     if _is_armature(settings.target_rig) and settings.target_rig != source:
+        settings.target_origin = "已明确选择"
+        settings.target_candidates = ""
         return settings.target_rig
 
-    candidates = []
-    if blendcap_ready():
-        candidates.append(getattr(scene, "blendcap_retarget_target", None))
-    candidates.append(bpy.context.active_object)
-    candidates.extend(obj for obj in scene.objects if obj.type == "ARMATURE")
+    preferred = (
+        ("活动对象", bpy.context.active_object),
+        ("BlendCap 当前目标", getattr(scene, "blendcap_retarget_target", None) if blendcap_ready() else None),
+    )
+    for origin, candidate in preferred:
+        result = _candidate_result(source, candidate, settings.root_motion_mode)
+        if result is not None and not result.critical_missing and _is_mmd_candidate(candidate):
+            settings.target_origin = origin
+            settings.target_candidates = ""
+            return candidate
+
+    candidates = [obj for obj in scene.objects if obj.type == "ARMATURE" and _is_mmd_candidate(obj)]
 
     unique = []
     seen: set[int] = set()
@@ -160,11 +212,22 @@ def _auto_target(scene, settings, source):
             (
                 len(result.critical_missing),
                 -result.matched_count,
-                candidate.name,
                 candidate,
             )
         )
-    return min(ranked)[-1] if ranked else None
+    if not ranked:
+        settings.target_origin = ""
+        settings.target_candidates = ""
+        return None
+    best_score = min((row[0], row[1]) for row in ranked)
+    best = [row[-1] for row in ranked if (row[0], row[1]) == best_score]
+    if len(best) == 1:
+        settings.target_origin = "场景唯一最佳匹配"
+        settings.target_candidates = ""
+        return best[0]
+    settings.target_origin = ""
+    settings.target_candidates = "、".join(sorted(obj.name for obj in best))
+    return None
 
 
 def _resolve_rigs(scene, settings):
@@ -175,6 +238,22 @@ def _resolve_rigs(scene, settings):
     if target is not None and settings.target_rig != target:
         settings.target_rig = target
     return source, target
+
+
+def _proscenium_previewing(scene) -> bool:
+    props = getattr(scene, "proscenium", None)
+    return bool(props and getattr(props, "is_previewing", False))
+
+
+def _sync_proscenium_inplace(scene, settings) -> None:
+    if not settings.follow_proscenium_inplace:
+        return
+    props = getattr(scene, "proscenium", None)
+    if props is None or not hasattr(props, "inplace"):
+        return
+    desired = "IN_PLACE" if bool(props.inplace) else "FULL"
+    if settings.root_motion_mode != desired:
+        settings.root_motion_mode = desired
 
 
 def _rig_fingerprint(rig) -> list[dict]:
@@ -262,6 +341,23 @@ def _set_status(settings, result: MappingResult, valid: bool, message: str) -> N
     settings.unmatched = "、".join(result.missing)
     settings.warnings = "；".join(result.warnings)
     settings.status_message = message
+    settings.status_level = "READY" if valid else "ERROR"
+    settings.status_code = "MAPPING_READY" if valid else "MAPPING_INCOMPLETE"
+    settings.next_action = "点击“一键输出到 MMD”" if valid else "补齐目标关键骨或重新选择 MMD 骨架"
+
+
+def _set_failure(settings, code: str, message: str, next_action: str) -> None:
+    settings.mapping_valid = False
+    settings.mapping_signature = ""
+    settings.matched_count = 0
+    settings.expected_count = 0
+    settings.critical_missing = ""
+    settings.unmatched = ""
+    settings.warnings = ""
+    settings.status_level = "ERROR"
+    settings.status_code = code
+    settings.status_message = message
+    settings.next_action = next_action
 
 
 def _json_scalar(value):
@@ -317,6 +413,7 @@ def _capture_blendcap_state(scene, settings) -> dict:
         "settings": {
             "bridge_owns_current_table": bool(settings.bridge_owns_current_table),
             "previous_blendcap_mapping_json": settings.previous_blendcap_mapping_json,
+            "previous_blendcap_state_json": settings.previous_blendcap_state_json,
             "previous_blendcap_source": settings.previous_blendcap_source,
             "previous_blendcap_target": settings.previous_blendcap_target,
         },
@@ -329,12 +426,10 @@ def _capture_blendcap_state(scene, settings) -> dict:
 
 def _restore_blendcap_state(scene, settings, state: dict) -> None:
     scene_values = state.get("scene", {})
-    # Pointer updates can internally reload a preset, so restore them and
-    # other flags first, rebuild the exact table second, and restore the
-    # enum display value last.
+    # Pointer/preset updates can internally reload a preset. Restore every
+    # callback-bearing field first and rebuild the exact pair table last.
     for name, value in scene_values.items():
-        if name != "blendcap_retarget_preset":
-            _assign_if_present(scene, name, value)
+        _assign_if_present(scene, name, value)
     pairs = getattr(scene, "blendcap_retarget_pairs", None)
     if pairs is not None:
         pairs.clear()
@@ -342,12 +437,6 @@ def _restore_blendcap_state(scene, settings, state: dict) -> None:
             item = pairs.add()
             for name, value in row.items():
                 _assign_if_present(item, name, value)
-    if "blendcap_retarget_preset" in scene_values:
-        _assign_if_present(
-            scene,
-            "blendcap_retarget_preset",
-            scene_values["blendcap_retarget_preset"],
-        )
     blendcap_props = getattr(scene, "blendcap_props", None)
     if blendcap_props is not None and "use_custom_rest_pose" in state:
         _assign_if_present(
@@ -360,19 +449,44 @@ def _restore_blendcap_state(scene, settings, state: dict) -> None:
 
 
 def _snapshot_previous_mapping(scene, settings) -> None:
-    if settings.bridge_owns_current_table or settings.previous_blendcap_mapping_json:
+    if settings.bridge_owns_current_table or settings.previous_blendcap_state_json:
         return
     pairs = getattr(scene, "blendcap_retarget_pairs", None)
-    if pairs is None or len(pairs) == 0:
+    if pairs is None:
         return
-    settings.previous_blendcap_mapping_json = json.dumps(
-        [_serialize_blendcap_pair(pair) for pair in pairs],
-        ensure_ascii=False,
-    )
+    rows = [_serialize_blendcap_pair(pair) for pair in pairs]
+    settings.previous_blendcap_mapping_json = json.dumps(rows, ensure_ascii=False)
     source = getattr(scene, "blendcap_retarget_source", None)
     target = getattr(scene, "blendcap_retarget_target", None)
     settings.previous_blendcap_source = source.name if source else ""
     settings.previous_blendcap_target = target.name if target else ""
+    scene_state = {}
+    for name in _BLENDCAP_TRANSACTION_FIELDS:
+        if not hasattr(scene, name):
+            continue
+        value = getattr(scene, name)
+        if isinstance(value, bpy.types.Object):
+            scene_state[name] = {"object": value.name}
+        elif value is None and name in {"blendcap_retarget_source", "blendcap_retarget_target"}:
+            scene_state[name] = {"object": None}
+        else:
+            scalar = _json_scalar(value)
+            if scalar is not None:
+                scene_state[name] = scalar
+    blendcap_props = getattr(scene, "blendcap_props", None)
+    settings.previous_blendcap_state_json = json.dumps(
+        {
+            "schema": 1,
+            "scene": scene_state,
+            "pairs": rows,
+            "use_custom_rest_pose": (
+                bool(blendcap_props.use_custom_rest_pose)
+                if blendcap_props is not None and hasattr(blendcap_props, "use_custom_rest_pose")
+                else None
+            ),
+        },
+        ensure_ascii=False,
+    )
 
 
 def _assign_if_present(owner, name: str, value) -> None:
@@ -426,15 +540,44 @@ def _write_blendcap_mapping(scene, settings, source, target, result: MappingResu
 def _prepare_mapping(scene, settings, write_table: bool):
     source, target = _resolve_rigs(scene, settings)
     if source is None:
-        return None, None, None, "未找到带 kimodo-soma-rp 标记的 Proscenium 官方骨架"
+        if settings.source_candidates:
+            message = f"检测到多个官方骨架：{settings.source_candidates}"
+            next_action = "在“官方动作骨架”中明确选择本次 Proscenium 骨架"
+        else:
+            message = "未找到带 kimodo-soma-rp 标记的 Proscenium 官方骨架"
+            next_action = "连接 Proscenium 并导入官方骨架"
+        _set_failure(settings, "SOURCE_NOT_FOUND", message, next_action)
+        return None, None, None, message
     if not _is_official_source(source):
-        return source, None, None, "源骨架不是完整的 Proscenium kimodo-soma-rp 官方骨架"
+        message = "源骨架不是完整的 Proscenium kimodo-soma-rp 官方骨架"
+        _set_failure(settings, "SOURCE_INVALID", message, "重新导入官方骨架，不要使用自定义或传统 BVH 骨架")
+        return source, None, None, message
+    proscenium = getattr(scene, "proscenium", None)
+    if (
+        proscenium is not None
+        and bool(getattr(proscenium, "is_generating", False))
+        and getattr(proscenium, "target_armature", None) == source
+    ):
+        message = "Proscenium 正在生成；已阻止输出上一条旧动作"
+        _set_failure(settings, "GENERATION_BUSY", message, "等待本次生成完成并预览/接受")
+        return source, None, None, message
     if target is None:
-        return source, None, None, "未找到可映射的 MMD 目标骨架"
+        if settings.target_candidates:
+            message = f"多个 MMD 骨架同分：{settings.target_candidates}"
+            next_action = "在“MMD 目标骨架”中明确选择要写入的角色"
+        else:
+            message = "未找到可映射的 MMD 目标骨架"
+            next_action = "选择 MMD 人体 Armature"
+        _set_failure(settings, "TARGET_AMBIGUOUS", message, next_action)
+        return source, None, None, message
     if source == target:
-        return source, target, None, "源骨架和目标骨架不能是同一个对象"
+        message = "源骨架和目标骨架不能是同一个对象"
+        _set_failure(settings, "SAME_RIG", message, "重新选择 MMD 目标骨架")
+        return source, target, None, message
     if not _uniform_scale(source) or not _uniform_scale(target):
-        return source, target, None, "检测到非等比对象缩放；请先应用缩放，避免位移和骨长失真"
+        message = "检测到非等比、零值或镜像对象缩放；已阻止可能失真的重定向"
+        _set_failure(settings, "NON_UNIFORM_SCALE", message, f"在角色副本中选择 {source.name if not _uniform_scale(source) else target.name}，Ctrl+A → Scale")
+        return source, target, None, message
 
     result = build_mapping(source, target, settings.root_motion_mode)
     settings.scale_ratio = _semantic_scale_ratio(source, target, result)
@@ -444,14 +587,16 @@ def _prepare_mapping(scene, settings, write_table: bool):
     settings.mapping_signature = signature
     valid = not result.critical_missing
     if valid:
-        message = f"高置信度：{result.matched_count}/{result.expected_count} 对主链已映射"
+        message = f"必需主链完整：{result.matched_count}/{result.expected_count} 对已映射"
     else:
         message = f"关键骨缺失：{'、'.join(result.critical_missing)}"
     _set_status(settings, result, valid, message)
 
     if write_table and valid:
         if not blendcap_ready():
-            return source, target, result, "BlendCap 未启用，无法写入世界空间重定向表"
+            message = "BlendCap 未启用，无法执行世界空间重定向"
+            _set_failure(settings, "BLENDCAP_MISSING", message, "启用 BlendCap 1.0.5 后重试")
+            return source, target, result, message
         _write_blendcap_mapping(scene, settings, source, target, result)
     return source, target, result, None if valid else message
 
@@ -823,12 +968,12 @@ def _restore_source_action(scene, source, state: dict) -> None:
 class BAM_OT_auto_map(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.auto_map"
     bl_label = "自动映射官方骨架 → MMD"
-    bl_description = "识别官方 SOMA 骨架语义并在内存中生成 BlendCap 重定向表；不会写 preset 文件"
+    bl_description = "识别官方 SOMA 骨架语义并检查 MMD 主链；只生成 Bridge 内部映射，不改 BlendCap 当前表"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         settings = context.scene.ba_motion_bridge_settings
-        source, target, result, error = _prepare_mapping(context.scene, settings, write_table=True)
+        source, target, result, error = _prepare_mapping(context.scene, settings, write_table=False)
         if error:
             self.report({"ERROR"}, error)
             return {"CANCELLED"}
@@ -836,6 +981,33 @@ class BAM_OT_auto_map(bpy.types.Operator):
             {"INFO"},
             f"已映射 {result.matched_count}/{result.expected_count} 对：{source.name} → {target.name}",
         )
+        return {"FINISHED"}
+
+
+class BAM_OT_prepare_from_proscenium(bpy.types.Operator):
+    bl_idname = "ba_motion_bridge.prepare_from_proscenium"
+    bl_label = "自动准备 MMD 输出"
+    bl_description = "读取 Proscenium 官方骨架、自动寻找最佳 MMD 目标并完成高置信度映射检查"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.ba_motion_bridge_settings
+        proscenium = getattr(scene, "proscenium", None)
+        hosted_source = getattr(proscenium, "target_armature", None) if proscenium else None
+        if _is_official_source(hosted_source) and settings.source_rig != hosted_source:
+            settings.source_rig = hosted_source
+            settings.source_origin = "Proscenium 当前骨架"
+        _sync_proscenium_inplace(scene, settings)
+        source, target, result, error = _prepare_mapping(scene, settings, write_table=False)
+        if error:
+            self.report({"ERROR"}, error)
+            return {"CANCELLED"}
+        settings.status_message = (
+            f"已准备：{source.name} → {target.name}；"
+            f"主链 {result.matched_count}/{result.expected_count}"
+        )
+        self.report({"INFO"}, settings.status_message)
         return {"FINISHED"}
 
 
@@ -872,11 +1044,23 @@ class BAM_OT_retarget(bpy.types.Operator):
             self.report({"ERROR"}, error)
             return {"CANCELLED"}
         if not blendcap_ready():
+            _set_failure(settings, "BLENDCAP_MISSING", "BlendCap 未启用，无法执行世界空间 rest-pose bake", "启用 BlendCap 1.0.5 后重试")
             self.report({"ERROR"}, "BlendCap 未启用，无法执行世界空间 rest-pose bake")
             return {"CANCELLED"}
         if not _animation_present(source):
+            _set_failure(settings, "MOTION_MISSING", "官方骨架没有活动 Action 或已接受的 NLA 动作", "在 Proscenium 生成并接受动作")
             self.report({"ERROR"}, "官方骨架没有活动 Action 或已接受的 NLA 动作")
             return {"CANCELLED"}
+        if settings.previous_target_state_available:
+            try:
+                baseline_target = settings.previous_target_rig
+            except ReferenceError:
+                baseline_target = None
+            if baseline_target is not None and baseline_target != target:
+                message = f"恢复基线属于 {baseline_target.name}；已阻止把同一会话切到 {target.name}"
+                _set_failure(settings, "BASELINE_TARGET_CONFLICT", message, "先点击“恢复角色原状态”，再选择另一角色")
+                self.report({"ERROR"}, message)
+                return {"CANCELLED"}
 
         blendcap_state = _capture_blendcap_state(scene, settings)
         classic_module = _blendcap_classic_engine_module()
@@ -951,14 +1135,20 @@ class BAM_OT_retarget(bpy.types.Operator):
             settings.constraint_snapshot_target_rig = target if constraint_rows else None
             new_snapshot_written = bool(constraint_rows)
             settings.last_output_action = created_action.name
-            settings.previous_target_state_available = True
-            settings.previous_target_rig = target
-            settings.previous_target_action = previous_action
-            settings.previous_target_action_name = previous_action.name if previous_action else ""
-            settings.previous_target_action_slot = previous_action_slot_identifier
-            settings.previous_target_use_nla = bool(previous_use_nla)
-            settings.previous_target_action_fake_user = bool(previous_action_fake_user or False)
-            settings.status_message = f"完成：{created_action.name}（原动作已保留）"
+            if not settings.previous_target_state_available:
+                settings.previous_target_state_available = True
+                settings.previous_target_rig = target
+                settings.previous_target_action = previous_action
+                settings.previous_target_action_name = previous_action.name if previous_action else ""
+                settings.previous_target_action_slot = previous_action_slot_identifier
+                settings.previous_target_use_nla = bool(previous_use_nla)
+                settings.previous_target_action_fake_user = bool(previous_action_fake_user or False)
+            settings.status_level = "READY"
+            settings.status_code = "RETARGET_COMPLETE"
+            settings.next_action = "预览结果；需要回到角色原状态时点击恢复按钮"
+            settings.status_message = (
+                f"完成：{created_action.name}；暂时关闭 {disabled_constraints} 个相关约束"
+            )
             success = True
         except Exception as exc:
             error_message = str(exc)
@@ -997,6 +1187,12 @@ class BAM_OT_retarget(bpy.types.Operator):
                     classic_module.USE_FAST_ENGINE = previous_engine
 
         if not success:
+            _set_failure(
+                settings,
+                "RETARGET_FAILED",
+                f"重定向失败；原动作/NLA/约束已恢复：{error_message}",
+                "按错误提示修正后重试；已接受的 Proscenium 动作不会丢失",
+            )
             self.report({"ERROR"}, f"重定向失败，原动作/NLA/约束已恢复：{error_message}")
             return {"CANCELLED"}
 
@@ -1006,6 +1202,93 @@ class BAM_OT_retarget(bpy.types.Operator):
             f"已生成独立动作 {created_action.name}；{result.matched_count} 对骨骼，"
             f"仅关闭 {disabled_constraints} 个已映射腿链/腰取消约束",
         )
+        return {"FINISHED"}
+
+
+class BAM_OT_accept_and_retarget(bpy.types.Operator):
+    bl_idname = "ba_motion_bridge.accept_and_retarget"
+    bl_label = "接受并一键输出到 MMD"
+    bl_description = (
+        "若 Proscenium 正在预览则先接受动作，再自动识别官方骨架和 MMD 目标、"
+        "检查映射并生成独立 MMD Action"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return hasattr(context.scene, "ba_motion_bridge_settings")
+
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.ba_motion_bridge_settings
+        proscenium = getattr(scene, "proscenium", None)
+        hosted_source = getattr(proscenium, "target_armature", None) if proscenium else None
+        if _is_official_source(hosted_source) and settings.source_rig != hosted_source:
+            settings.source_rig = hosted_source
+            settings.source_origin = "Proscenium 当前骨架"
+        _sync_proscenium_inplace(scene, settings)
+        accepted = False
+        if settings.accept_preview_on_run and _proscenium_previewing(scene):
+            if not operator_available("proscenium.accept"):
+                self.report({"ERROR"}, "Proscenium Accept 未注册，请重启或重新启用插件")
+                return {"CANCELLED"}
+            try:
+                accept_result = bpy.ops.proscenium.accept("EXEC_DEFAULT")
+            except (AttributeError, RuntimeError) as exc:
+                self.report({"ERROR"}, f"接受 Proscenium 预览失败：{exc}")
+                return {"CANCELLED"}
+            if accept_result != {"FINISHED"}:
+                self.report({"ERROR"}, f"Proscenium Accept 未完成：{accept_result}")
+                return {"CANCELLED"}
+            accepted = True
+        try:
+            result = bpy.ops.ba_motion_bridge.retarget("EXEC_DEFAULT")
+        except (AttributeError, RuntimeError) as exc:
+            suffix = "；已接受的 Proscenium 动作仍保留" if accepted else ""
+            self.report({"ERROR"}, f"MMD 输出失败：{exc}{suffix}")
+            return {"CANCELLED"}
+        if result != {"FINISHED"}:
+            suffix = "；已接受的 Proscenium 动作仍保留" if accepted else ""
+            self.report({"ERROR"}, f"MMD 输出未完成：{result}{suffix}")
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            "已接受预览并输出独立 MMD Action" if accepted else "已输出独立 MMD Action",
+        )
+        return {"FINISHED"}
+
+
+class BAM_OT_activate_output(bpy.types.Operator):
+    bl_idname = "ba_motion_bridge.activate_output"
+    bl_label = "激活上次 MMD 输出"
+    bl_description = "把上次桥接生成的独立 Action 重新设为目标骨架的活动动作"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "ba_motion_bridge_settings", None)
+        return bool(settings and settings.last_output_action)
+
+    def execute(self, context):
+        settings = context.scene.ba_motion_bridge_settings
+        action = bpy.data.actions.get(settings.last_output_action)
+        try:
+            target = settings.target_rig
+        except ReferenceError:
+            target = None
+        if action is None or not _is_armature(target):
+            self.report({"ERROR"}, "上次输出 Action 或目标骨架已不存在")
+            return {"CANCELLED"}
+        animation_data = target.animation_data_create()
+        try:
+            _bind_action(animation_data, action)
+            animation_data.use_nla = False
+        except (AttributeError, RuntimeError, TypeError) as exc:
+            self.report({"ERROR"}, f"激活输出失败：{exc}")
+            return {"CANCELLED"}
+        _activate_target(context, target)
+        settings.status_message = f"已激活输出：{action.name}"
+        self.report({"INFO"}, settings.status_message)
         return {"FINISHED"}
 
 
@@ -1086,19 +1369,30 @@ class BAM_OT_restore_previous_target_animation(bpy.types.Operator):
 class BAM_OT_restore_previous_mapping(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.restore_previous_mapping"
     bl_label = "恢复之前的 BlendCap 映射"
-    bl_description = "恢复桥接器第一次写表前的内存骨骼对；不会读取或覆盖 preset 文件"
+    bl_description = "恢复桥接器第一次写表前的 source/target、preset、比例/rest flags 和精确骨骼对；不会写文件"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
         settings = getattr(context.scene, "ba_motion_bridge_settings", None)
-        return bool(settings and settings.previous_blendcap_mapping_json and blendcap_ready())
+        return bool(
+            settings
+            and (settings.previous_blendcap_state_json or settings.previous_blendcap_mapping_json)
+            and blendcap_ready()
+        )
 
     def execute(self, context):
         scene = context.scene
         settings = scene.ba_motion_bridge_settings
+        state = None
+        if settings.previous_blendcap_state_json:
+            try:
+                state = json.loads(settings.previous_blendcap_state_json)
+            except json.JSONDecodeError as exc:
+                self.report({"ERROR"}, f"完整映射备份无效：{exc}")
+                return {"CANCELLED"}
         try:
-            rows = json.loads(settings.previous_blendcap_mapping_json)
+            rows = state.get("pairs", []) if isinstance(state, dict) else json.loads(settings.previous_blendcap_mapping_json)
         except json.JSONDecodeError as exc:
             self.report({"ERROR"}, f"映射备份无效：{exc}")
             return {"CANCELLED"}
@@ -1106,10 +1400,27 @@ class BAM_OT_restore_previous_mapping(bpy.types.Operator):
             self.report({"ERROR"}, "映射备份格式无效")
             return {"CANCELLED"}
 
-        if settings.previous_blendcap_source:
-            _assign_if_present(scene, "blendcap_retarget_source", bpy.data.objects.get(settings.previous_blendcap_source))
-        if settings.previous_blendcap_target:
-            _assign_if_present(scene, "blendcap_retarget_target", bpy.data.objects.get(settings.previous_blendcap_target))
+        if isinstance(state, dict):
+            for name, value in state.get("scene", {}).items():
+                if isinstance(value, dict) and "object" in value:
+                    object_name = value["object"]
+                    value = bpy.data.objects.get(object_name) if object_name else None
+                _assign_if_present(scene, name, value)
+            blendcap_props = getattr(scene, "blendcap_props", None)
+            custom_rest = state.get("use_custom_rest_pose")
+            if blendcap_props is not None and custom_rest is not None:
+                _assign_if_present(blendcap_props, "use_custom_rest_pose", bool(custom_rest))
+        else:
+            _assign_if_present(
+                scene,
+                "blendcap_retarget_source",
+                bpy.data.objects.get(settings.previous_blendcap_source) if settings.previous_blendcap_source else None,
+            )
+            _assign_if_present(
+                scene,
+                "blendcap_retarget_target",
+                bpy.data.objects.get(settings.previous_blendcap_target) if settings.previous_blendcap_target else None,
+            )
         scene.blendcap_retarget_pairs.clear()
         for row in rows:
             if not isinstance(row, dict):
@@ -1119,11 +1430,61 @@ class BAM_OT_restore_previous_mapping(bpy.types.Operator):
                 _assign_if_present(item, name, value)
         count = len(scene.blendcap_retarget_pairs)
         settings.previous_blendcap_mapping_json = ""
+        settings.previous_blendcap_state_json = ""
         settings.previous_blendcap_source = ""
         settings.previous_blendcap_target = ""
         settings.bridge_owns_current_table = False
         settings.mapping_valid = False
         settings.status_message = f"已恢复之前的 BlendCap 映射（{count} 对）"
+        self.report({"INFO"}, settings.status_message)
+        return {"FINISHED"}
+
+
+class BAM_OT_restore_previous_state(bpy.types.Operator):
+    bl_idname = "ba_motion_bridge.restore_previous_state"
+    bl_label = "恢复角色原状态"
+    bl_description = "依次恢复桥接前的腿链约束、目标 Action/NLA 和 BlendCap 内存映射；输出 Action 保留"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "ba_motion_bridge_settings", None)
+        return bool(
+            settings
+            and (
+                settings.constraint_snapshot_json
+                or settings.previous_target_state_available
+                or settings.previous_blendcap_mapping_json
+            )
+        )
+
+    def execute(self, context):
+        settings = context.scene.ba_motion_bridge_settings
+        restored = []
+        steps = (
+            (bool(settings.constraint_snapshot_json), "ba_motion_bridge.restore_constraints", "约束"),
+            (bool(settings.previous_target_state_available), "ba_motion_bridge.restore_previous_target_animation", "目标动画"),
+            (bool(settings.previous_blendcap_mapping_json), "ba_motion_bridge.restore_previous_mapping", "BlendCap 映射"),
+        )
+        for needed, path, label in steps:
+            if not needed:
+                continue
+            namespace, name = path.split(".", 1)
+            try:
+                result = getattr(getattr(bpy.ops, namespace), name)("EXEC_DEFAULT")
+            except (AttributeError, RuntimeError) as exc:
+                _set_failure(settings, "RESTORE_FAILED", f"恢复{label}失败：{exc}", "不要继续重定向；先检查详细恢复项")
+                self.report({"ERROR"}, settings.status_message)
+                return {"CANCELLED"}
+            if result != {"FINISHED"}:
+                _set_failure(settings, "RESTORE_FAILED", f"恢复{label}未完成：{result}", "不要继续重定向；先检查详细恢复项")
+                self.report({"ERROR"}, settings.status_message)
+                return {"CANCELLED"}
+            restored.append(label)
+        settings.status_level = "READY"
+        settings.status_code = "BASELINE_RESTORED"
+        settings.next_action = "可继续选择或生成新的候选动作"
+        settings.status_message = f"已恢复角色原状态：{'、'.join(restored)}；输出 Action 仍保留"
         self.report({"INFO"}, settings.status_message)
         return {"FINISHED"}
 
@@ -1160,12 +1521,16 @@ class BAM_OT_cleanup_temporary(bpy.types.Operator):
 
 
 CLASSES = (
+    BAM_OT_prepare_from_proscenium,
     BAM_OT_auto_map,
     BAM_OT_validate_mapping,
     BAM_OT_retarget,
+    BAM_OT_accept_and_retarget,
+    BAM_OT_activate_output,
     BAM_OT_restore_constraints,
     BAM_OT_restore_previous_target_animation,
     BAM_OT_restore_previous_mapping,
+    BAM_OT_restore_previous_state,
     BAM_OT_cleanup_temporary,
 )
 

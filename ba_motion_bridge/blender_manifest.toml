@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "ba_motion_bridge"
-version = "0.1.0"
+version = "0.2.0"
 name = "BA Motion Bridge"
-tagline = "Retarget Proscenium canonical motion to MMD rigs"
+tagline = "One-click Proscenium canonical motion output for MMD rigs"
 maintainer = "Local Workflow Toolkit"
 type = "add-on"
 

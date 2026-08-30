@@ -184,6 +184,17 @@ _ROOT_Z_TARGETS = (
     "ParentNode",
 )
 
+_ROLE_LABELS = {
+    "shoulder": "肩",
+    "upper_arm": "上臂",
+    "forearm": "前臂",
+    "hand": "手腕",
+    "thigh": "大腿",
+    "shin": "小腿",
+    "foot": "脚踝",
+    "toe": "脚尖",
+}
+
 
 def _resolve_hips_target(
     lookup: dict[str, list[str]],
@@ -293,25 +304,40 @@ def build_mapping(source_rig, target_rig, root_motion_mode: str = "FULL") -> Map
             )
         )
 
-    spine_slots = [
-        target(("下半身", "LowerBody", "Spine")),
-        target(("上半身", "UpperBody", "Spine1")),
-        target(("上半身2", "UpperBody2", "Spine2")),
-        target(("上半身3", "UpperBody3", "Spine3")),
+    raw_spine_slots = [
+        ("lower", target(("下半身", "LowerBody", "Spine"))),
+        ("upper", target(("上半身", "UpperBody", "Spine1"))),
+        ("upper2", target(("上半身2", "UpperBody2", "Spine2"))),
+        ("upper3", target(("上半身3", "UpperBody3", "Spine3"))),
     ]
-    spine_slots = list(dict.fromkeys(item for item in spine_slots if item))
+    spine_slots = []
+    seen_spine_targets = set()
+    for slot_role, slot_target in raw_spine_slots:
+        if slot_target and slot_target not in seen_spine_targets:
+            seen_spine_targets.add(slot_target)
+            spine_slots.append((slot_role, slot_target))
     source_spine = [source["spine_low"], source["spine_mid"], source["chest"]]
     if not spine_slots:
         missing.append("躯干（下半身/上半身）")
         critical_missing.append("躯干（下半身/上半身）")
     else:
         if len(spine_slots) == 1:
-            chosen_sources = [source_spine[-1]]
+            only_role = spine_slots[0][0]
+            chosen_sources = [{
+                "lower": source["spine_low"],
+                "upper": source["spine_mid"],
+                "upper2": source["chest"],
+                "upper3": source["chest"],
+            }[only_role]]
+            warnings.append("目标只有一段躯干骨；已按其下/上半身语义压缩官方躯干链")
         elif len(spine_slots) == 2:
-            chosen_sources = [source_spine[0], source_spine[-1]]
+            chosen_sources = [
+                source["spine_low"] if spine_slots[0][0] == "lower" else source["spine_mid"],
+                source["chest"],
+            ]
         else:
             chosen_sources = source_spine
-        for index, (source_name, target_name) in enumerate(zip(chosen_sources, spine_slots)):
+        for index, (source_name, (_slot_role, target_name)) in enumerate(zip(chosen_sources, spine_slots)):
             pairs.append(
                 MappingPair(
                     source=source_name,
@@ -342,7 +368,7 @@ def build_mapping(source_rig, target_rig, root_motion_mode: str = "FULL") -> Map
                 source[f"{word}_{role}"],
                 found,
                 critical=required,
-                label=f"{'左' if side == 'L' else '右'}{role}",
+                label=f"{'左' if side == 'L' else '右'}{_ROLE_LABELS[role]}",
             )
 
     neck = target(("首", "Neck"))
@@ -350,7 +376,7 @@ def build_mapping(source_rig, target_rig, root_motion_mode: str = "FULL") -> Map
     add("neck", source["neck"], neck, critical=True, label="首")
     add("head", source["head"], head, critical=True, label="头")
 
-    torso_landmark = spine_slots[0] if spine_slots else None
+    torso_landmark = spine_slots[0][1] if spine_slots else None
     hips_target = _resolve_hips_target(
         lookup,
         parents,
