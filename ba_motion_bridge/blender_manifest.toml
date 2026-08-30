@@ -1,0 +1,23 @@
+schema_version = "1.0.0"
+
+id = "ba_motion_bridge"
+version = "0.1.0"
+name = "BA Motion Bridge"
+tagline = "Retarget Proscenium canonical motion to MMD rigs"
+maintainer = "Local Workflow Toolkit"
+type = "add-on"
+
+tags = ["Animation", "Rigging", "Pipeline"]
+blender_version_min = "5.1.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  ".git",
+  "*.zip",
+  "tests/",
+]
