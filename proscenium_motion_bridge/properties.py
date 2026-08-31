@@ -37,6 +37,18 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
         items=ROOT_MOTION_ITEMS,
         default="FULL",
         update=_invalidate_mapping,
+        options={"HIDDEN"},
+    )
+    root_motion_policy: EnumProperty(
+        name="根运动",
+        description="自动跟随 Proscenium 的 In-place 状态，或明确强制输出完整位移/原地动作",
+        items=(
+            ("AUTO", "自动跟随 Proscenium", "根据 Proscenium 的 In-place 开关自动决定"),
+            ("FULL", "完整位移", "传递角色整体移动；可设置世界空间和体型比例"),
+            ("IN_PLACE", "原地动作", "不传递 Hips 的水平整体位移"),
+        ),
+        default="AUTO",
+        update=_invalidate_mapping,
     )
     auto_scale: BoolProperty(
         name="主链体型比例",
@@ -57,6 +69,7 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
         name="跟随 Proscenium 原地模式",
         description="一键输出时根据 Proscenium Preview 的 In-place 开关自动选择完整位移或原地动作",
         default=True,
+        options={"HIDDEN"},
     )
     use_start_buffer: BoolProperty(
         name="启用起始缓冲",
@@ -159,6 +172,7 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
     target_switch_snapshot_json: StringProperty(default="", options={"HIDDEN"})
     target_switch_snapshot_target: StringProperty(default="", options={"HIDDEN"})
     physics_cache_snapshot_json: StringProperty(default="", options={"HIDDEN"})
+    timeline_snapshot_json: StringProperty(default="", options={"HIDDEN"})
 
 
 CLASSES = (BAM_PG_settings,)

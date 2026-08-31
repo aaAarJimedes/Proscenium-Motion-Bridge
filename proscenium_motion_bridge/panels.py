@@ -1,6 +1,11 @@
 import bpy
 
-from .operators import _animation_present, _is_official_source, blendcap_ready
+from .operators import (
+    _animation_present,
+    _effective_root_motion_mode,
+    _is_official_source,
+    blendcap_ready,
+)
 
 
 def _live_armature(obj) -> bool:
@@ -77,14 +82,48 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
             text="目标已选择" if target_ready else "等待角色目标",
             icon="CHECKMARK" if target_ready else "INFO",
         )
+        try:
+            previous_target = settings.previous_target_rig
+        except ReferenceError:
+            previous_target = None
+        target_conflict = bool(
+            settings.previous_target_state_available
+            and previous_target
+            and settings.target_rig
+            and previous_target != settings.target_rig
+        )
+        if target_conflict:
+            conflict = rigs.box()
+            conflict.alert = True
+            conflict.label(text=f"{previous_target.name} 仍有一个待处理恢复点", icon="ERROR")
+            conflict.label(text="“保留”会结束上一角色的一键恢复点", icon="INFO")
+            row = conflict.row(align=True)
+            restore = row.operator(
+                "ba_motion_bridge.resolve_target_switch",
+                text="恢复上一角色后切换",
+                icon="LOOP_BACK",
+            )
+            restore.mode = "RESTORE"
+            keep = row.operator(
+                "ba_motion_bridge.resolve_target_switch",
+                text="保留上一角色输出",
+                icon="CHECKMARK",
+            )
+            keep.mode = "KEEP"
 
         options = layout.box()
         options.label(text="2. 输出设置", icon="SETTINGS")
-        options.prop(settings, "root_motion_mode", expand=True)
-        row = options.row(align=True)
-        row.prop(settings, "auto_scale")
-        row.prop(settings, "world_location")
-        options.prop(settings, "follow_proscenium_inplace")
+        options.prop(settings, "root_motion_policy")
+        effective_root_motion = _effective_root_motion_mode(context.scene, settings)
+        if settings.root_motion_policy == "AUTO":
+            options.label(
+                text="当前：完整位移" if effective_root_motion == "FULL" else "当前：原地动作",
+                icon="INFO",
+            )
+        if effective_root_motion == "FULL":
+            row = options.row(align=True)
+            row.prop(settings, "auto_scale")
+            row.prop(settings, "world_location")
         options.prop(settings, "accept_preview_on_run")
 
         buffer = options.box()
@@ -99,8 +138,10 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
             row.prop(settings, "transition_frames")
             buffer.prop(settings, "evaluate_physics_preroll")
             buffer.label(text="正式动作首帧不移动；缓冲保存在首帧之前", icon="INFO")
+            buffer.label(text="自动显示负帧预览范围，并停在缓冲起点", icon="TIME")
 
         mapping = layout.box()
+        mapping.enabled = not target_conflict
         mapping.label(text="3. 识别与检查", icon="VIEWZOOM")
         row = mapping.row(align=True)
         row.operator("ba_motion_bridge.prepare_from_proscenium", text="自动识别并检查", icon="VIEWZOOM")
@@ -124,7 +165,12 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
         run = output.column()
         run.scale_y = 1.5
         motion_ready = source_ready and _animation_present(settings.source_rig)
-        run.enabled = dependencies_ready and not generating and (previewing or motion_ready or settings.source_rig is None)
+        run.enabled = (
+            dependencies_ready
+            and not generating
+            and not target_conflict
+            and (previewing or motion_ready or settings.source_rig is None)
+        )
         run.operator(
             "ba_motion_bridge.accept_and_retarget",
             text="接受并输出到角色" if previewing else "一键输出到角色",

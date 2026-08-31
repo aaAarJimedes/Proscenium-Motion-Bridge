@@ -8,6 +8,7 @@ import statistics
 import sys
 
 import bpy
+from bpy.props import EnumProperty
 from mathutils import Matrix, Quaternion
 
 from .constants import (
@@ -281,13 +282,18 @@ def _proscenium_previewing(scene) -> bool:
     return bool(props and getattr(props, "is_previewing", False))
 
 
-def _sync_proscenium_inplace(scene, settings) -> None:
-    if not settings.follow_proscenium_inplace:
-        return
+def _effective_root_motion_mode(scene, settings) -> str:
+    policy = getattr(settings, "root_motion_policy", "AUTO")
+    if policy in {"FULL", "IN_PLACE"}:
+        return policy
     props = getattr(scene, "proscenium", None)
     if props is None or not hasattr(props, "inplace"):
-        return
-    desired = "IN_PLACE" if bool(props.inplace) else "FULL"
+        return getattr(settings, "root_motion_mode", "FULL")
+    return "IN_PLACE" if bool(props.inplace) else "FULL"
+
+
+def _sync_proscenium_inplace(scene, settings) -> None:
+    desired = _effective_root_motion_mode(scene, settings)
     if settings.root_motion_mode != desired:
         settings.root_motion_mode = desired
 
@@ -1209,6 +1215,69 @@ def _physics_cache_snapshot(scene) -> dict:
     }
 
 
+def _timeline_snapshot(scene) -> dict:
+    return {
+        "frame_start": int(scene.frame_start),
+        "frame_current": int(scene.frame_current),
+        "use_preview_range": bool(scene.use_preview_range),
+        "frame_preview_start": int(scene.frame_preview_start),
+        "frame_preview_end": int(scene.frame_preview_end),
+    }
+
+
+def _restore_timeline_snapshot(scene, snapshot: dict) -> bool:
+    if not snapshot or "frame_start" not in snapshot:
+        return False
+    scene.frame_start = int(snapshot["frame_start"])
+    scene.use_preview_range = bool(snapshot.get("use_preview_range", scene.use_preview_range))
+    if "frame_preview_start" in snapshot:
+        scene.frame_preview_start = int(snapshot["frame_preview_start"])
+    if "frame_preview_end" in snapshot:
+        scene.frame_preview_end = int(snapshot["frame_preview_end"])
+    scene.frame_set(int(snapshot.get("frame_current", scene.frame_start)))
+    bpy.context.view_layer.update()
+    return True
+
+
+def _restore_saved_timeline(scene, settings) -> str:
+    if not settings.timeline_snapshot_json:
+        return "NONE"
+    try:
+        snapshot = json.loads(settings.timeline_snapshot_json)
+    except json.JSONDecodeError:
+        return "INVALID"
+    restored = _restore_timeline_snapshot(scene, snapshot)
+    settings.timeline_snapshot_json = ""
+    return "RESTORED" if restored else "SKIPPED"
+
+
+def _extend_preroll_timeline(scene, preroll_start: int) -> dict:
+    preroll_start = int(preroll_start)
+    # Scene.frame_start is hard-clamped to 0 by Blender 5.1.  A negative
+    # preview range is not clamped, remains draggable in the Timeline, and the
+    # rigid-body point cache independently accepts the same negative start.
+    scene.frame_start = min(int(scene.frame_start), preroll_start)
+    scene.use_preview_range = True
+    scene.frame_preview_start = min(int(scene.frame_preview_start), preroll_start)
+    scene.frame_preview_end = max(int(scene.frame_preview_end), int(scene.frame_end))
+    rigidbody_world = getattr(scene, "rigidbody_world", None)
+    point_cache = getattr(rigidbody_world, "point_cache", None)
+    cache_status = "NO_RIGID_BODY_WORLD"
+    if point_cache is not None:
+        if bool(getattr(point_cache, "is_baked", False)):
+            cache_status = "BAKED_CACHE"
+        else:
+            point_cache.frame_start = min(int(point_cache.frame_start), preroll_start)
+            cache_status = "EXTENDED"
+    scene.frame_set(preroll_start)
+    bpy.context.view_layer.update()
+    return {
+        "timeline_start": preroll_start,
+        "scene_start": int(scene.frame_start),
+        "cache_status": cache_status,
+    }
+
+
 def _restore_physics_cache_snapshot(scene, snapshot: dict) -> bool:
     if not snapshot or not snapshot.get("present"):
         return False
@@ -1235,24 +1304,26 @@ def _restore_saved_physics_cache(scene, settings) -> str:
 
 
 def _evaluate_physics_preroll(scene, preroll_start: int, motion_start: int) -> dict:
+    timeline_result = _extend_preroll_timeline(scene, preroll_start)
     rigidbody_world = getattr(scene, "rigidbody_world", None)
     point_cache = getattr(rigidbody_world, "point_cache", None)
     if point_cache is None:
-        scene.frame_set(motion_start)
         return {"status": "NO_RIGID_BODY_WORLD", "evaluated_frames": 0}
     if bool(getattr(point_cache, "is_baked", False)):
-        scene.frame_set(motion_start)
         return {"status": "BAKED_CACHE", "evaluated_frames": 0}
 
-    point_cache.frame_start = min(int(point_cache.frame_start), int(preroll_start))
     evaluated = 0
     for frame in range(int(preroll_start), int(motion_start) + 1):
         scene.frame_set(frame)
         bpy.context.view_layer.update()
         evaluated += 1
-    scene.frame_set(motion_start)
+    scene.frame_set(preroll_start)
     bpy.context.view_layer.update()
-    return {"status": "EVALUATED", "evaluated_frames": evaluated}
+    return {
+        "status": "EVALUATED",
+        "evaluated_frames": evaluated,
+        "timeline_start": timeline_result["timeline_start"],
+    }
     suitable = list(getattr(animation_data, "action_suitable_slots", ()) or ())
     if suitable:
         try:
@@ -1475,6 +1546,7 @@ class BAM_OT_retarget(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
         settings = scene.ba_motion_bridge_settings
+        _sync_proscenium_inplace(scene, settings)
         source, target, result, error = _prepare_mapping(scene, settings, write_table=False)
         if error:
             self.report({"ERROR"}, error)
@@ -1494,7 +1566,7 @@ class BAM_OT_retarget(bpy.types.Operator):
                 baseline_target = None
             if baseline_target is not None and baseline_target != target:
                 message = f"恢复基线属于 {baseline_target.name}；已阻止把同一会话切到 {target.name}"
-                _set_failure(settings, "BASELINE_TARGET_CONFLICT", message, "先点击“恢复角色原状态”，再选择另一角色")
+                _set_failure(settings, "BASELINE_TARGET_CONFLICT", message, "在骨架区选择恢复上一角色或保留上一输出")
                 self.report({"ERROR"}, message)
                 return {"CANCELLED"}
 
@@ -1512,6 +1584,7 @@ class BAM_OT_retarget(bpy.types.Operator):
         constraint_rows: list[dict] = []
         switch_rows_before_attempt = _target_switch_snapshot(target)
         physics_cache_before_attempt = _physics_cache_snapshot(scene)
+        timeline_before_attempt = _timeline_snapshot(scene)
         rest_override_patch = None
         disabled_constraints = 0
         created_action = None
@@ -1598,8 +1671,11 @@ class BAM_OT_retarget(bpy.types.Operator):
                         buffer_result["preroll_start"],
                         buffer_result["motion_start"],
                     )
+                else:
+                    _extend_preroll_timeline(scene, buffer_result["preroll_start"])
                 created_action["bam_physics_preroll_status"] = physics_result["status"]
                 created_action["bam_physics_preroll_frames"] = int(physics_result["evaluated_frames"])
+                created_action["bam_timeline_frame_start"] = int(buffer_result["preroll_start"])
 
             settings.constraint_snapshot_json = (
                 json.dumps(constraint_rows, ensure_ascii=False) if constraint_rows else ""
@@ -1616,6 +1692,9 @@ class BAM_OT_retarget(bpy.types.Operator):
                 settings.physics_cache_snapshot_json = json.dumps(
                     physics_cache_before_attempt, ensure_ascii=False
                 )
+                settings.timeline_snapshot_json = json.dumps(
+                    timeline_before_attempt, ensure_ascii=False
+                )
                 settings.previous_target_state_available = True
                 settings.previous_target_rig = target
                 settings.previous_target_action = previous_action
@@ -1629,14 +1708,19 @@ class BAM_OT_retarget(bpy.types.Operator):
             buffer_note = ""
             if buffer_result is not None:
                 buffer_note = (
-                    f"；缓冲 {buffer_result['inserted_frames']} 帧，正式首帧 "
-                    f"{buffer_result['motion_start']}"
+                    f"；预览范围从 {buffer_result['preroll_start']} 预滚动到正式首帧 "
+                    f"{buffer_result['motion_start']}，当前停在 {buffer_result['preroll_start']}"
                 )
                 if physics_result["status"] == "BAKED_CACHE":
                     buffer_note += "；检测到已烘焙旧物理缓存，未自动预热"
                     settings.status_level = "WARNING"
                     settings.status_code = "RETARGET_COMPLETE_PHYSICS_CACHE_BAKED"
                     settings.next_action = "释放旧物理缓存后重新激活输出，或重新烘焙包含预滚动区的物理"
+                elif physics_result["status"] == "NO_RIGID_BODY_WORLD":
+                    buffer_note += "；尚未检测到刚体世界"
+                    settings.status_level = "WARNING"
+                    settings.status_code = "RETARGET_COMPLETE_NO_RIGID_BODY_WORLD"
+                    settings.next_action = "先用 MMD Tools 建立刚体世界，再点“激活”以写入负帧缓存起点"
                 elif physics_result["status"] == "EVALUATED":
                     buffer_note += f"；物理预热 {physics_result['evaluated_frames']} 帧"
             settings.status_message = (
@@ -1654,6 +1738,7 @@ class BAM_OT_retarget(bpy.types.Operator):
             if missing_switches:
                 error_message += f"；{missing_switches} 个 IK/FK 状态无法恢复"
             _restore_physics_cache_snapshot(scene, physics_cache_before_attempt)
+            _restore_timeline_snapshot(scene, timeline_before_attempt)
             failed_action = animation_data.action if animation_data is not None else None
             if animation_data is not None:
                 try:
@@ -1698,6 +1783,9 @@ class BAM_OT_retarget(bpy.types.Operator):
             return {"CANCELLED"}
 
         _activate_target(context, target)
+        if buffer_result is not None:
+            scene.frame_set(int(buffer_result["preroll_start"]))
+            bpy.context.view_layer.update()
         self.report(
             {"INFO"},
             f"已生成独立动作 {created_action.name}；{result.matched_count} 对骨骼，"
@@ -1864,6 +1952,7 @@ class BAM_OT_restore_previous_target_animation(bpy.types.Operator):
             if missing_switches:
                 raise RuntimeError(f"{missing_switches} 个 IK/FK 状态无法精确恢复")
             physics_restore = _restore_saved_physics_cache(context.scene, settings)
+            timeline_restore = _restore_saved_timeline(context.scene, settings)
         except (AttributeError, ReferenceError, RuntimeError, TypeError) as exc:
             self.report({"ERROR"}, f"切回目标动画失败：{exc}")
             return {"CANCELLED"}
@@ -1877,8 +1966,11 @@ class BAM_OT_restore_previous_target_animation(bpy.types.Operator):
         physics_note = "，恢复物理缓存起点" if physics_restore == "RESTORED" else ""
         if physics_restore in {"INVALID", "SKIPPED"}:
             physics_note = "，物理缓存起点未改动"
+        timeline_note = "，恢复原时间轴" if timeline_restore == "RESTORED" else ""
+        if timeline_restore in {"INVALID", "SKIPPED"}:
+            timeline_note = "，原时间轴未改动"
         settings.status_message = (
-            f"已切回重定向前的目标动画{switch_note}{physics_note}；桥接输出仍保留在 Action 数据块中"
+            f"已切回重定向前的目标动画{switch_note}{physics_note}{timeline_note}；桥接输出仍保留在 Action 数据块中"
         )
         self.report({"INFO"}, settings.status_message)
         return {"FINISHED"}
@@ -2007,6 +2099,75 @@ class BAM_OT_restore_previous_state(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class BAM_OT_resolve_target_switch(bpy.types.Operator):
+    bl_idname = "ba_motion_bridge.resolve_target_switch"
+    bl_label = "处理上一角色恢复点"
+    bl_description = "在切换目标角色前，明确决定恢复上一角色，或保留其当前桥接输出并结束恢复点"
+    bl_options = {"REGISTER", "UNDO"}
+
+    mode: EnumProperty(
+        items=(
+            ("RESTORE", "恢复上一角色后切换", "恢复上一角色的 Action、约束、IK/FK、时间轴和缓存起点"),
+            ("KEEP", "保留上一角色输出", "保留当前桥接输出和禁用约束，放弃对上一角色的一键恢复点"),
+        )
+    )
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "ba_motion_bridge_settings", None)
+        if not settings or not settings.previous_target_state_available:
+            return False
+        try:
+            previous_target = settings.previous_target_rig
+            target = settings.target_rig
+        except ReferenceError:
+            return False
+        return bool(previous_target and target and previous_target != target)
+
+    def execute(self, context):
+        settings = context.scene.ba_motion_bridge_settings
+        target = settings.target_rig
+        previous_target = settings.previous_target_rig
+        previous_name = previous_target.name if previous_target else "上一角色"
+        target_name = target.name if target else "新角色"
+
+        if self.mode == "RESTORE":
+            result = bpy.ops.ba_motion_bridge.restore_previous_state("EXEC_DEFAULT")
+            if result != {"FINISHED"}:
+                self.report({"ERROR"}, f"恢复 {previous_name} 未完成：{result}")
+                return {"CANCELLED"}
+            settings.target_rig = target
+            settings.mapping_valid = False
+            settings.status_level = "INFO"
+            settings.status_code = "TARGET_SWITCH_RESOLVED"
+            settings.next_action = "点击“自动识别并检查”"
+            settings.status_message = f"已恢复 {previous_name}；现在可安全输出到 {target_name}"
+        else:
+            previous_action = settings.previous_target_action
+            if previous_action is not None:
+                previous_action.use_fake_user = bool(settings.previous_target_action_fake_user)
+            settings.constraint_snapshot_json = ""
+            settings.constraint_snapshot_target = ""
+            settings.constraint_snapshot_target_rig = None
+            settings.previous_target_state_available = False
+            settings.previous_target_rig = None
+            settings.previous_target_action = None
+            settings.previous_target_action_name = ""
+            settings.previous_target_action_slot = ""
+            settings.target_switch_snapshot_json = ""
+            settings.target_switch_snapshot_target = ""
+            settings.physics_cache_snapshot_json = ""
+            settings.timeline_snapshot_json = ""
+            settings.mapping_valid = False
+            settings.status_level = "INFO"
+            settings.status_code = "TARGET_SWITCH_OUTPUT_KEPT"
+            settings.next_action = "点击“自动识别并检查”"
+            settings.status_message = f"已保留 {previous_name} 的桥接输出；现在可输出到 {target_name}"
+
+        self.report({"INFO"}, settings.status_message)
+        return {"FINISHED"}
+
+
 class BAM_OT_cleanup_temporary(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.cleanup_temporary"
     bl_label = "清理桥接临时资源"
@@ -2049,6 +2210,7 @@ CLASSES = (
     BAM_OT_restore_previous_target_animation,
     BAM_OT_restore_previous_mapping,
     BAM_OT_restore_previous_state,
+    BAM_OT_resolve_target_switch,
     BAM_OT_cleanup_temporary,
 )
 
