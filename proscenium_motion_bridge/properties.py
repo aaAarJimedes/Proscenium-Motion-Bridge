@@ -58,6 +58,52 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
         description="一键输出时根据 Proscenium Preview 的 In-place 开关自动选择完整位移或原地动作",
         default=True,
     )
+    use_start_buffer: BoolProperty(
+        name="启用起始缓冲",
+        description="在正式动作首帧之前生成静置与平滑过渡，并顺序求值该区间供裙发物理预热；正式动作时间码保持不变",
+        default=True,
+    )
+    initial_pose_source: EnumProperty(
+        name="初始姿态来源",
+        description="选择起始缓冲使用的角色姿态",
+        items=(
+            ("CURRENT", "当前角色姿态", "使用点击重定向时目标骨架当前帧的姿态"),
+            ("REST", "目标 Rest Pose", "使用目标骨架的静置姿态（Matrix Basis 归零）"),
+            ("ACTION_FRAME", "指定 Action 帧", "从指定目标 Action 的某一帧读取初始姿态"),
+        ),
+        default="CURRENT",
+    )
+    initial_pose_action: PointerProperty(
+        name="初始姿态 Action",
+        description="从这个 Action 的指定帧读取主体控制骨姿态；不会修改该 Action",
+        type=bpy.types.Action,
+    )
+    initial_pose_frame: IntProperty(
+        name="姿态帧",
+        description="读取所选初始姿态 Action 的帧号",
+        default=1,
+        min=-1048574,
+        max=1048574,
+    )
+    settle_frames: IntProperty(
+        name="静置帧",
+        description="保持初始姿态、让裙发刚体稳定的帧数；设为 0 可跳过",
+        default=10,
+        min=0,
+        max=1000,
+    )
+    transition_frames: IntProperty(
+        name="过渡帧",
+        description="从初始姿态逐帧平滑进入正式动作首帧的帧数；设为 0 可跳过",
+        default=20,
+        min=0,
+        max=1000,
+    )
+    evaluate_physics_preroll: BoolProperty(
+        name="顺序预热物理",
+        description="重定向完成后从缓冲起点逐帧求值到正式首帧；不会擅自清除已经烘焙的物理缓存",
+        default=True,
+    )
     mapping_valid: BoolProperty(default=False, options={"HIDDEN"})
     status_level: EnumProperty(
         items=(
@@ -112,6 +158,7 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
     previous_target_action_fake_user: BoolProperty(default=False, options={"HIDDEN"})
     target_switch_snapshot_json: StringProperty(default="", options={"HIDDEN"})
     target_switch_snapshot_target: StringProperty(default="", options={"HIDDEN"})
+    physics_cache_snapshot_json: StringProperty(default="", options={"HIDDEN"})
 
 
 CLASSES = (BAM_PG_settings,)

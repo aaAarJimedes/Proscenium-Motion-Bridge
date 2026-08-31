@@ -1048,6 +1048,211 @@ def _bind_action(animation_data, action, preferred_slot=None) -> None:
             return
         except (AttributeError, RuntimeError, TypeError):
             pass
+
+
+def _mapped_target_channels(result: MappingResult) -> tuple[set[str], set[str]]:
+    rotation_targets: set[str] = set()
+    location_targets: set[str] = set()
+    for pair in result.pairs:
+        if pair.channels in {"ROT", "LOC_ROT"}:
+            rotation_targets.add(pair.target)
+        if pair.channels in {"LOC", "LOC_ROT"}:
+            location_targets.add(pair.target)
+    return rotation_targets, location_targets
+
+
+def _snapshot_pose_basis(target, bone_names: set[str]) -> dict[str, Matrix]:
+    return {
+        name: target.pose.bones[name].matrix_basis.copy()
+        for name in bone_names
+        if name in target.pose.bones
+    }
+
+
+def _capture_buffer_initial_pose(scene, settings, target, result: MappingResult) -> dict[str, Matrix]:
+    """Read the user-selected initial pose without changing target animation state."""
+    rotation_targets, location_targets = _mapped_target_channels(result)
+    bone_names = rotation_targets | location_targets
+    if settings.initial_pose_source == "REST":
+        return {name: Matrix.Identity(4) for name in bone_names if name in target.pose.bones}
+
+    animation_data = target.animation_data_create()
+    if settings.initial_pose_source == "CURRENT":
+        bpy.context.view_layer.update()
+        return _snapshot_pose_basis(target, bone_names)
+
+    action = settings.initial_pose_action
+    if action is None:
+        raise RuntimeError("起始缓冲选择了“指定 Action 帧”，但尚未选择初始姿态 Action")
+
+    previous_frame = scene.frame_current
+    previous_action = animation_data.action
+    previous_slot = _action_slot(animation_data)
+    previous_use_nla = bool(animation_data.use_nla)
+    try:
+        _bind_action(animation_data, action)
+        animation_data.use_nla = False
+        scene.frame_set(settings.initial_pose_frame)
+        bpy.context.view_layer.update()
+        return _snapshot_pose_basis(target, bone_names)
+    finally:
+        _bind_action(animation_data, previous_action, previous_slot)
+        animation_data.use_nla = previous_use_nla
+        scene.frame_set(previous_frame)
+        bpy.context.view_layer.update()
+
+
+def _interpolate_basis(initial: Matrix, final: Matrix, factor: float) -> Matrix:
+    factor = max(0.0, min(1.0, float(factor)))
+    initial_location, initial_rotation, initial_scale = initial.decompose()
+    final_location, final_rotation, final_scale = final.decompose()
+    # Smoothstep keeps both ends still and avoids injecting an abrupt velocity
+    # into skirt/hair rigid bodies at either boundary.
+    smooth = factor * factor * (3.0 - 2.0 * factor)
+    return Matrix.LocRotScale(
+        initial_location.lerp(final_location, smooth),
+        initial_rotation.slerp(final_rotation, smooth),
+        initial_scale.lerp(final_scale, smooth),
+    )
+
+
+def _rotation_property(pose_bone) -> str:
+    if pose_bone.rotation_mode == "QUATERNION":
+        return "rotation_quaternion"
+    if pose_bone.rotation_mode == "AXIS_ANGLE":
+        return "rotation_axis_angle"
+    return "rotation_euler"
+
+
+def _insert_start_buffer(
+    scene,
+    target,
+    action,
+    result: MappingResult,
+    initial_pose: dict[str, Matrix],
+    settle_frames: int,
+    transition_frames: int,
+) -> dict:
+    """Add hidden pre-roll keys while preserving the formal motion range."""
+    settle_frames = max(0, int(settle_frames))
+    transition_frames = max(0, int(transition_frames))
+    total_frames = settle_frames + transition_frames
+    raw_start, raw_end = (float(value) for value in action.frame_range)
+    motion_start = int(round(raw_start))
+    motion_end = int(round(raw_end))
+    if total_frames <= 0:
+        return {
+            "motion_start": motion_start,
+            "motion_end": motion_end,
+            "preroll_start": motion_start,
+            "inserted_frames": 0,
+        }
+
+    rotation_targets, location_targets = _mapped_target_channels(result)
+    target_names = rotation_targets | location_targets
+    scene.frame_set(motion_start)
+    bpy.context.view_layer.update()
+    first_pose = _snapshot_pose_basis(target, target_names)
+    missing = sorted(name for name in target_names if name not in initial_pose or name not in first_pose)
+    if missing:
+        raise RuntimeError("起始缓冲无法读取目标骨姿态：" + "、".join(missing[:8]))
+
+    preroll_start = motion_start - total_frames
+    transition_start = motion_start - transition_frames
+    for frame in range(preroll_start, motion_start):
+        factor = 0.0
+        if transition_frames > 0 and frame >= transition_start:
+            factor = (frame - transition_start) / float(transition_frames)
+        for bone_name in target_names:
+            pose_bone = target.pose.bones[bone_name]
+            pose_bone.matrix_basis = _interpolate_basis(
+                initial_pose[bone_name],
+                first_pose[bone_name],
+                factor,
+            )
+            if bone_name in rotation_targets:
+                pose_bone.keyframe_insert(_rotation_property(pose_bone), frame=frame, group=bone_name)
+            if bone_name in location_targets:
+                pose_bone.keyframe_insert("location", frame=frame, group=bone_name)
+
+    for fcurve in _iter_action_fcurves(action):
+        for point in fcurve.keyframe_points:
+            if point.co.x < motion_start:
+                point.interpolation = "LINEAR"
+        fcurve.update()
+
+    # Blender's custom Action range is the logical trim: pre-roll keys remain
+    # available for physics evaluation, while NLA/export sees the real motion
+    # starting at its original first frame.
+    if hasattr(action, "use_frame_range"):
+        action.use_frame_range = True
+        action.frame_start = motion_start
+        action.frame_end = motion_end
+    scene.frame_set(motion_start)
+    bpy.context.view_layer.update()
+    return {
+        "motion_start": motion_start,
+        "motion_end": motion_end,
+        "preroll_start": preroll_start,
+        "inserted_frames": total_frames,
+    }
+
+
+def _physics_cache_snapshot(scene) -> dict:
+    rigidbody_world = getattr(scene, "rigidbody_world", None)
+    point_cache = getattr(rigidbody_world, "point_cache", None)
+    if point_cache is None:
+        return {"present": False}
+    return {
+        "present": True,
+        "frame_start": int(point_cache.frame_start),
+    }
+
+
+def _restore_physics_cache_snapshot(scene, snapshot: dict) -> bool:
+    if not snapshot or not snapshot.get("present"):
+        return False
+    rigidbody_world = getattr(scene, "rigidbody_world", None)
+    point_cache = getattr(rigidbody_world, "point_cache", None)
+    if point_cache is None or bool(getattr(point_cache, "is_baked", False)):
+        return False
+    point_cache.frame_start = int(snapshot["frame_start"])
+    return True
+
+
+def _restore_saved_physics_cache(scene, settings) -> str:
+    if not settings.physics_cache_snapshot_json:
+        return "NONE"
+    try:
+        snapshot = json.loads(settings.physics_cache_snapshot_json)
+    except json.JSONDecodeError:
+        return "INVALID"
+    restored = _restore_physics_cache_snapshot(scene, snapshot)
+    settings.physics_cache_snapshot_json = ""
+    if restored:
+        return "RESTORED"
+    return "SKIPPED"
+
+
+def _evaluate_physics_preroll(scene, preroll_start: int, motion_start: int) -> dict:
+    rigidbody_world = getattr(scene, "rigidbody_world", None)
+    point_cache = getattr(rigidbody_world, "point_cache", None)
+    if point_cache is None:
+        scene.frame_set(motion_start)
+        return {"status": "NO_RIGID_BODY_WORLD", "evaluated_frames": 0}
+    if bool(getattr(point_cache, "is_baked", False)):
+        scene.frame_set(motion_start)
+        return {"status": "BAKED_CACHE", "evaluated_frames": 0}
+
+    point_cache.frame_start = min(int(point_cache.frame_start), int(preroll_start))
+    evaluated = 0
+    for frame in range(int(preroll_start), int(motion_start) + 1):
+        scene.frame_set(frame)
+        bpy.context.view_layer.update()
+        evaluated += 1
+    scene.frame_set(motion_start)
+    bpy.context.view_layer.update()
+    return {"status": "EVALUATED", "evaluated_frames": evaluated}
     suitable = list(getattr(animation_data, "action_suitable_slots", ()) or ())
     if suitable:
         try:
@@ -1306,9 +1511,13 @@ class BAM_OT_retarget(bpy.types.Operator):
         before_actions: set[int] = set()
         constraint_rows: list[dict] = []
         switch_rows_before_attempt = _target_switch_snapshot(target)
+        physics_cache_before_attempt = _physics_cache_snapshot(scene)
         rest_override_patch = None
         disabled_constraints = 0
         created_action = None
+        initial_pose: dict[str, Matrix] = {}
+        buffer_result = None
+        physics_result = {"status": "DISABLED", "evaluated_frames": 0}
         source_motion = "Proscenium_Motion"
         new_snapshot_written = False
         error_message = ""
@@ -1332,6 +1541,9 @@ class BAM_OT_retarget(bpy.types.Operator):
             if previous_action is not None:
                 previous_action_fake_user = bool(previous_action.use_fake_user)
                 previous_action.use_fake_user = True
+
+            if settings.use_start_buffer and (settings.settle_frames + settings.transition_frames) > 0:
+                initial_pose = _capture_buffer_initial_pose(scene, settings, target, result)
 
             before_actions = {action.as_pointer() for action in bpy.data.actions}
             _restored, restore_missing = _restore_saved_constraints(settings)
@@ -1364,6 +1576,31 @@ class BAM_OT_retarget(bpy.types.Operator):
             created_action["bam_engine"] = "BlendCap Classic" if classic_module is not None else "BlendCap Fast"
             created_action["bam_disabled_constraint_count"] = disabled_constraints
 
+            if settings.use_start_buffer and (settings.settle_frames + settings.transition_frames) > 0:
+                buffer_result = _insert_start_buffer(
+                    scene,
+                    target,
+                    created_action,
+                    result,
+                    initial_pose,
+                    settings.settle_frames,
+                    settings.transition_frames,
+                )
+                created_action["bam_motion_frame_start"] = buffer_result["motion_start"]
+                created_action["bam_motion_frame_end"] = buffer_result["motion_end"]
+                created_action["bam_preroll_frame_start"] = buffer_result["preroll_start"]
+                created_action["bam_preroll_settle_frames"] = int(settings.settle_frames)
+                created_action["bam_preroll_transition_frames"] = int(settings.transition_frames)
+                created_action["bam_initial_pose_source"] = settings.initial_pose_source
+                if settings.evaluate_physics_preroll:
+                    physics_result = _evaluate_physics_preroll(
+                        scene,
+                        buffer_result["preroll_start"],
+                        buffer_result["motion_start"],
+                    )
+                created_action["bam_physics_preroll_status"] = physics_result["status"]
+                created_action["bam_physics_preroll_frames"] = int(physics_result["evaluated_frames"])
+
             settings.constraint_snapshot_json = (
                 json.dumps(constraint_rows, ensure_ascii=False) if constraint_rows else ""
             )
@@ -1376,6 +1613,9 @@ class BAM_OT_retarget(bpy.types.Operator):
                     switch_rows_before_attempt, ensure_ascii=False
                 )
                 settings.target_switch_snapshot_target = target.name
+                settings.physics_cache_snapshot_json = json.dumps(
+                    physics_cache_before_attempt, ensure_ascii=False
+                )
                 settings.previous_target_state_available = True
                 settings.previous_target_rig = target
                 settings.previous_target_action = previous_action
@@ -1386,9 +1626,22 @@ class BAM_OT_retarget(bpy.types.Operator):
             settings.status_level = "READY"
             settings.status_code = "RETARGET_COMPLETE"
             settings.next_action = "预览结果；需要回到角色原状态时点击恢复按钮"
+            buffer_note = ""
+            if buffer_result is not None:
+                buffer_note = (
+                    f"；缓冲 {buffer_result['inserted_frames']} 帧，正式首帧 "
+                    f"{buffer_result['motion_start']}"
+                )
+                if physics_result["status"] == "BAKED_CACHE":
+                    buffer_note += "；检测到已烘焙旧物理缓存，未自动预热"
+                    settings.status_level = "WARNING"
+                    settings.status_code = "RETARGET_COMPLETE_PHYSICS_CACHE_BAKED"
+                    settings.next_action = "释放旧物理缓存后重新激活输出，或重新烘焙包含预滚动区的物理"
+                elif physics_result["status"] == "EVALUATED":
+                    buffer_note += f"；物理预热 {physics_result['evaluated_frames']} 帧"
             settings.status_message = (
                 f"完成：{created_action.name}；{result.target_profile}；"
-                f"暂时关闭 {disabled_constraints} 个相关约束"
+                f"暂时关闭 {disabled_constraints} 个相关约束{buffer_note}"
             )
             success = True
         except Exception as exc:
@@ -1400,6 +1653,7 @@ class BAM_OT_retarget(bpy.types.Operator):
             )
             if missing_switches:
                 error_message += f"；{missing_switches} 个 IK/FK 状态无法恢复"
+            _restore_physics_cache_snapshot(scene, physics_cache_before_attempt)
             failed_action = animation_data.action if animation_data is not None else None
             if animation_data is not None:
                 try:
@@ -1531,6 +1785,12 @@ class BAM_OT_activate_output(bpy.types.Operator):
             _bind_action(animation_data, action)
             animation_data.use_nla = False
             _force_target_fk_switches(target)
+            motion_start = int(action.get("bam_motion_frame_start", context.scene.frame_start))
+            preroll_start = int(action.get("bam_preroll_frame_start", motion_start))
+            if preroll_start < motion_start:
+                _evaluate_physics_preroll(context.scene, preroll_start, motion_start)
+            else:
+                context.scene.frame_set(motion_start)
         except (AttributeError, RuntimeError, TypeError) as exc:
             self.report({"ERROR"}, f"激活输出失败：{exc}")
             return {"CANCELLED"}
@@ -1603,6 +1863,7 @@ class BAM_OT_restore_previous_target_animation(bpy.types.Operator):
             restored_switches, missing_switches = _restore_saved_target_switches(settings, target)
             if missing_switches:
                 raise RuntimeError(f"{missing_switches} 个 IK/FK 状态无法精确恢复")
+            physics_restore = _restore_saved_physics_cache(context.scene, settings)
         except (AttributeError, ReferenceError, RuntimeError, TypeError) as exc:
             self.report({"ERROR"}, f"切回目标动画失败：{exc}")
             return {"CANCELLED"}
@@ -1613,8 +1874,11 @@ class BAM_OT_restore_previous_target_animation(bpy.types.Operator):
         settings.previous_target_action_name = ""
         settings.previous_target_action_slot = ""
         switch_note = f"，恢复 {restored_switches} 个 IK/FK 状态" if restored_switches else ""
+        physics_note = "，恢复物理缓存起点" if physics_restore == "RESTORED" else ""
+        if physics_restore in {"INVALID", "SKIPPED"}:
+            physics_note = "，物理缓存起点未改动"
         settings.status_message = (
-            f"已切回重定向前的目标动画{switch_note}；桥接输出仍保留在 Action 数据块中"
+            f"已切回重定向前的目标动画{switch_note}{physics_note}；桥接输出仍保留在 Action 数据块中"
         )
         self.report({"INFO"}, settings.status_message)
         return {"FINISHED"}

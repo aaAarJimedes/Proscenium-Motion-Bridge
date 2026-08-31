@@ -87,6 +87,19 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
         options.prop(settings, "follow_proscenium_inplace")
         options.prop(settings, "accept_preview_on_run")
 
+        buffer = options.box()
+        buffer.prop(settings, "use_start_buffer", icon="PREVIEW_RANGE")
+        if settings.use_start_buffer:
+            buffer.prop(settings, "initial_pose_source")
+            if settings.initial_pose_source == "ACTION_FRAME":
+                buffer.prop(settings, "initial_pose_action")
+                buffer.prop(settings, "initial_pose_frame")
+            row = buffer.row(align=True)
+            row.prop(settings, "settle_frames")
+            row.prop(settings, "transition_frames")
+            buffer.prop(settings, "evaluate_physics_preroll")
+            buffer.label(text="正式动作首帧不移动；缓冲保存在首帧之前", icon="INFO")
+
         mapping = layout.box()
         mapping.label(text="3. 识别与检查", icon="VIEWZOOM")
         row = mapping.row(align=True)
@@ -117,7 +130,7 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
             text="接受并输出到角色" if previewing else "一键输出到角色",
             icon="ACTION",
         )
-        output.label(text="静置姿态补偿 · 独立 Action · 失败自动回滚", icon="LOCKED")
+        output.label(text="静置方向补偿 · 起始缓冲 · 独立 Action · 失败回滚", icon="LOCKED")
 
         finish = layout.box()
         finish.label(text="5. 结果与恢复", icon="RECOVER_LAST")
