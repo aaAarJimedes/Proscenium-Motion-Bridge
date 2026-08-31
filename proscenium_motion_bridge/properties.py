@@ -19,15 +19,15 @@ def _invalidate_mapping(self, _context):
 
 class BAM_PG_settings(bpy.types.PropertyGroup):
     source_rig: PointerProperty(
-        name="官方动作骨架",
+        name="Proscenium 源骨架",
         description="Proscenium kimodo-soma-rp 官方骨架；可包含活动 Action 或 NLA 动作",
         type=bpy.types.Object,
         poll=_armature_poll,
         update=_invalidate_mapping,
     )
     target_rig: PointerProperty(
-        name="MMD 目标骨架",
-        description="要接收动作的 MMD Tools 骨架",
+        name="角色目标骨架",
+        description="要接收动作的 MMD FK 骨架或 Auto-Rig Pro 控制器骨架",
         type=bpy.types.Object,
         poll=_armature_poll,
         update=_invalidate_mapping,
@@ -50,7 +50,7 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
     )
     accept_preview_on_run: BoolProperty(
         name="一键时接受当前预览",
-        description="Proscenium 正在预览时，先执行 Accept，再立即重定向到 MMD；Accept 成功后即使重定向失败，生成结果也会保留",
+        description="Proscenium 正在预览时，先执行 Accept，再立即重定向到角色；Accept 成功后即使重定向失败，生成结果也会保留",
         default=True,
     )
     follow_proscenium_inplace: BoolProperty(
@@ -71,7 +71,7 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
         options={"HIDDEN"},
     )
     status_code: StringProperty(default="NOT_READY", options={"HIDDEN"})
-    next_action: StringProperty(default="先生成官方骨架动作，再选择 MMD 目标", options={"HIDDEN"})
+    next_action: StringProperty(default="先生成官方骨架动作，再选择角色目标", options={"HIDDEN"})
     source_origin: StringProperty(default="", options={"HIDDEN"})
     target_origin: StringProperty(default="", options={"HIDDEN"})
     source_candidates: StringProperty(default="", options={"HIDDEN"})
@@ -83,6 +83,7 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
     warnings: StringProperty(default="", options={"HIDDEN"})
     scale_ratio: FloatProperty(default=1.0, min=0.0001, options={"HIDDEN"})
     status_message: StringProperty(default="尚未映射", options={"HIDDEN"})
+    target_profile: StringProperty(default="", options={"HIDDEN"})
     mapping_json: StringProperty(default="", options={"HIDDEN"})
     mapping_signature: StringProperty(default="", options={"HIDDEN"})
     bridge_owns_current_table: BoolProperty(default=False, options={"HIDDEN"})
@@ -109,6 +110,8 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
     previous_target_action_slot: StringProperty(default="", options={"HIDDEN"})
     previous_target_use_nla: BoolProperty(default=False, options={"HIDDEN"})
     previous_target_action_fake_user: BoolProperty(default=False, options={"HIDDEN"})
+    target_switch_snapshot_json: StringProperty(default="", options={"HIDDEN"})
+    target_switch_snapshot_target: StringProperty(default="", options={"HIDDEN"})
 
 
 CLASSES = (BAM_PG_settings,)

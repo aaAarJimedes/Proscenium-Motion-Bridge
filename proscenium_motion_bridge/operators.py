@@ -5,14 +5,17 @@ import importlib
 import json
 import re
 import statistics
+import sys
 
 import bpy
+from mathutils import Matrix, Quaternion
 
 from .constants import (
     CANONICAL_MODEL_ID,
     CANONICAL_MODEL_KEY,
     OWNER_KEY,
     OWNER_VALUE,
+    OWNER_VALUES,
     TEMPORARY_KEY,
 )
 from .mapping import MappingResult, build_mapping, is_official_canonical_bones, normalize
@@ -37,8 +40,8 @@ def blendcap_ready() -> bool:
     )
 
 
-def mmd2blendcap_ready() -> bool:
-    return operator_available("mmd2blendcap.apply_retarget_fk_safe")
+def blendcap_motion_bridge_ready() -> bool:
+    return operator_available("blendcap_motion_bridge.apply_retarget_fk_safe")
 
 
 def _blendcap_classic_engine_module():
@@ -51,13 +54,46 @@ def _blendcap_classic_engine_module():
     """
     modules = [addon.module for addon in bpy.context.preferences.addons]
     base = next((name for name in modules if name.rsplit(".", 1)[-1] == "blendcap"), None)
-    if base is None:
-        return None
-    try:
-        module = importlib.import_module(base + ".blendcap.retarget.bake_fk")
-    except ImportError:
-        return None
-    return module if hasattr(module, "USE_FAST_ENGINE") else None
+    if base is not None:
+        try:
+            module = importlib.import_module(base + ".blendcap.retarget.bake_fk")
+        except ImportError:
+            module = None
+        if module is not None and hasattr(module, "USE_FAST_ENGINE"):
+            return module
+    # Source-tree regression tests register BlendCap without an extension
+    # preference entry. The same module is already present in that case.
+    return next(
+        (
+            module
+            for name, module in tuple(sys.modules.items())
+            if name.endswith("blendcap.retarget.bake_fk")
+            and hasattr(module, "USE_FAST_ENGINE")
+        ),
+        None,
+    )
+
+
+def _blendcap_operator_module():
+    """Return the loaded BlendCap retarget operator implementation."""
+    modules = [addon.module for addon in bpy.context.preferences.addons]
+    base = next((name for name in modules if name.rsplit(".", 1)[-1] == "blendcap"), None)
+    if base is not None:
+        try:
+            module = importlib.import_module(base + ".blendcap.operators_retarget")
+        except ImportError:
+            module = None
+        if module is not None and hasattr(module, "_matrix_bake_pairs_iter"):
+            return module
+    return next(
+        (
+            module
+            for name, module in tuple(sys.modules.items())
+            if name.endswith("blendcap.operators_retarget")
+            and hasattr(module, "_matrix_bake_pairs_iter")
+        ),
+        None,
+    )
 
 
 def _is_armature(obj) -> bool:
@@ -272,7 +308,7 @@ def _rig_fingerprint(rig) -> list[dict]:
 
 def _mapping_payload(source, target, root_motion_mode: str, result: MappingResult) -> dict:
     return {
-        "schema": 1,
+        "schema": 2,
         "source_object": source.name,
         "source_data": source.data.name,
         "target_object": target.name,
@@ -283,6 +319,7 @@ def _mapping_payload(source, target, root_motion_mode: str, result: MappingResul
         "critical_missing": list(result.critical_missing),
         "warnings": list(result.warnings),
         "expected_count": result.expected_count,
+        "target_profile": result.target_profile,
     }
 
 
@@ -340,10 +377,11 @@ def _set_status(settings, result: MappingResult, valid: bool, message: str) -> N
     settings.critical_missing = "、".join(result.critical_missing)
     settings.unmatched = "、".join(result.missing)
     settings.warnings = "；".join(result.warnings)
+    settings.target_profile = result.target_profile
     settings.status_message = message
     settings.status_level = "READY" if valid else "ERROR"
     settings.status_code = "MAPPING_READY" if valid else "MAPPING_INCOMPLETE"
-    settings.next_action = "点击“一键输出到 MMD”" if valid else "补齐目标关键骨或重新选择 MMD 骨架"
+    settings.next_action = "点击“一键输出到角色”" if valid else "补齐目标关键骨或重新选择角色骨架"
 
 
 def _set_failure(settings, code: str, message: str, next_action: str) -> None:
@@ -354,6 +392,7 @@ def _set_failure(settings, code: str, message: str, next_action: str) -> None:
     settings.critical_missing = ""
     settings.unmatched = ""
     settings.warnings = ""
+    settings.target_profile = ""
     settings.status_level = "ERROR"
     settings.status_code = code
     settings.status_message = message
@@ -392,10 +431,10 @@ _BLENDCAP_TRANSACTION_FIELDS = (
     "blendcap_retarget_use_current_pose_as_rest",
     "blendcap_retarget_current_pose_full_matrix",
     "blendcap_retarget_auto_bake_ik",
-    "mmd2blendcap_matched",
-    "mmd2blendcap_total",
-    "mmd2blendcap_unmatched",
-    "mmd2blendcap_hips_target",
+    "blendcap_motion_bridge_matched",
+    "blendcap_motion_bridge_total",
+    "blendcap_motion_bridge_unmatched",
+    "blendcap_motion_bridge_hips_target",
 )
 
 
@@ -510,6 +549,9 @@ def _write_blendcap_mapping(scene, settings, source, target, result: MappingResu
     # We instead put a semantic body-landmark median on the two LOC pairs.
     _assign_if_present(scene, "blendcap_retarget_auto_scale", False)
     _assign_if_present(scene, "blendcap_retarget_use_world_location", settings.world_location)
+    # The Bridge injects an explicit, in-memory source-rest override into the
+    # synchronous BlendCap bake. Do not sample or mutate the visible source
+    # pose: the current frame is animation data, not a trustworthy rest pose.
     _assign_if_present(scene, "blendcap_retarget_use_current_pose_as_rest", False)
     _assign_if_present(scene, "blendcap_retarget_current_pose_full_matrix", False)
     _assign_if_present(scene, "blendcap_retarget_auto_bake_ik", False)
@@ -529,11 +571,11 @@ def _write_blendcap_mapping(scene, settings, source, target, result: MappingResu
         if pair.channels == "LOC" and hasattr(item, "loc_scale"):
             item.loc_scale = settings.scale_ratio if settings.auto_scale else 1.0
 
-    _assign_if_present(scene, "mmd2blendcap_matched", result.matched_count)
-    _assign_if_present(scene, "mmd2blendcap_total", result.expected_count)
-    _assign_if_present(scene, "mmd2blendcap_unmatched", ", ".join(result.missing))
+    _assign_if_present(scene, "blendcap_motion_bridge_matched", result.matched_count)
+    _assign_if_present(scene, "blendcap_motion_bridge_total", result.expected_count)
+    _assign_if_present(scene, "blendcap_motion_bridge_unmatched", ", ".join(result.missing))
     hips = next((pair.target for pair in result.pairs if pair.role == "hips_rotation"), "")
-    _assign_if_present(scene, "mmd2blendcap_hips_target", hips)
+    _assign_if_present(scene, "blendcap_motion_bridge_hips_target", hips)
     settings.bridge_owns_current_table = True
 
 
@@ -563,16 +605,16 @@ def _prepare_mapping(scene, settings, write_table: bool):
         return source, None, None, message
     if target is None:
         if settings.target_candidates:
-            message = f"多个 MMD 骨架同分：{settings.target_candidates}"
-            next_action = "在“MMD 目标骨架”中明确选择要写入的角色"
+            message = f"多个角色骨架同分：{settings.target_candidates}"
+            next_action = "在“角色目标骨架”中明确选择要写入的角色"
         else:
-            message = "未找到可映射的 MMD 目标骨架"
-            next_action = "选择 MMD 人体 Armature"
+            message = "未找到可映射的 MMD/Auto-Rig Pro 目标骨架"
+            next_action = "选择角色的人体 Armature"
         _set_failure(settings, "TARGET_AMBIGUOUS", message, next_action)
         return source, None, None, message
     if source == target:
         message = "源骨架和目标骨架不能是同一个对象"
-        _set_failure(settings, "SAME_RIG", message, "重新选择 MMD 目标骨架")
+        _set_failure(settings, "SAME_RIG", message, "重新选择角色目标骨架")
         return source, target, None, message
     if not _uniform_scale(source) or not _uniform_scale(target):
         message = "检测到非等比、零值或镜像对象缩放；已阻止可能失真的重定向"
@@ -728,6 +770,195 @@ def _disable_constraint_rows(target, rows: list[dict]) -> int:
         constraint.mute = True
         constraint.influence = 0.0
     return disabled
+
+
+_TARGET_SWITCH_KEYS = ("IK_FK", "ik_fk_switch")
+
+
+def _target_switch_snapshot(target) -> list[dict]:
+    """Capture rig-level FK/IK properties changed by BlendCap's bake setup."""
+    rows: list[dict] = []
+    for pose_bone in target.pose.bones:
+        for key in _TARGET_SWITCH_KEYS:
+            if key not in pose_bone.keys():
+                continue
+            value = pose_bone[key]
+            if not isinstance(value, (bool, int, float)):
+                continue
+            rows.append({"owner": pose_bone.name, "key": key, "value": float(value)})
+    return rows
+
+
+def _restore_target_switch_rows(target, rows: list[dict]) -> tuple[int, int]:
+    restored = 0
+    missing = 0
+    for row in rows:
+        pose_bone = target.pose.bones.get(row.get("owner", ""))
+        key = row.get("key", "")
+        if pose_bone is None or key not in pose_bone.keys():
+            missing += 1
+            continue
+        try:
+            pose_bone[key] = float(row["value"])
+            restored += 1
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            missing += 1
+    try:
+        bpy.context.view_layer.update()
+    except (AttributeError, RuntimeError):
+        pass
+    return restored, missing
+
+
+def _restore_saved_target_switches(settings, target) -> tuple[int, int]:
+    if not settings.target_switch_snapshot_json:
+        return 0, 0
+    if settings.target_switch_snapshot_target and settings.target_switch_snapshot_target != target.name:
+        return 0, 1
+    try:
+        rows = json.loads(settings.target_switch_snapshot_json)
+    except json.JSONDecodeError:
+        return 0, 1
+    if not isinstance(rows, list):
+        return 0, 1
+    restored, missing = _restore_target_switch_rows(target, rows)
+    if missing == 0:
+        settings.target_switch_snapshot_json = ""
+        settings.target_switch_snapshot_target = ""
+    return restored, missing
+
+
+def _force_target_fk_switches(target) -> int:
+    changed = 0
+    for pose_bone in target.pose.bones:
+        for key in _TARGET_SWITCH_KEYS:
+            if key not in pose_bone.keys():
+                continue
+            try:
+                if abs(float(pose_bone[key]) - 1.0) > 1e-6:
+                    pose_bone[key] = 1.0
+                    changed += 1
+            except (RuntimeError, TypeError, ValueError):
+                pass
+    try:
+        bpy.context.view_layer.update()
+    except (AttributeError, RuntimeError):
+        pass
+    return changed
+
+
+_DIRECTION_ALIGNED_ROLES = frozenset(
+    {
+        "left_shoulder",
+        "left_upper_arm",
+        "left_forearm",
+        "left_hand",
+        "left_thigh",
+        "left_shin",
+        "left_foot",
+        "left_toe",
+        "right_shoulder",
+        "right_upper_arm",
+        "right_forearm",
+        "right_hand",
+        "right_thigh",
+        "right_shin",
+        "right_foot",
+        "right_toe",
+    }
+)
+
+
+def _twist_about_bone_y(rotation: Quaternion) -> Quaternion:
+    """Extract the twist component around Blender bone-local +Y."""
+    twist = Quaternion((rotation.w, 0.0, rotation.y, 0.0))
+    if twist.magnitude < 1e-8:
+        return Quaternion()
+    twist.normalize()
+    return twist
+
+
+def _build_source_rest_override(source, target, result: MappingResult) -> dict[str, Matrix]:
+    """Build BlendCap rest matrices with limb direction swing removed.
+
+    The canonical source rests in a T-pose while many converted MMD/ARP rigs
+    rest with their arms sloping down. BlendCap normally preserves that rest
+    direction offset, which rotates a two-handed gun pose inward and causes
+    the arms to cross. For limb pairs we retain only the offset's local-Y
+    twist (bone roll); torso/head/hips use the ordinary source edit rest.
+    """
+    rotation_pairs = []
+    seen_sources = set()
+    for pair in result.pairs:
+        if pair.channels not in {"ROT", "LOC_ROT"} or pair.source in seen_sources:
+            continue
+        if pair.source not in source.pose.bones or pair.target not in target.data.bones:
+            continue
+        seen_sources.add(pair.source)
+        rotation_pairs.append(pair)
+    source_world_q = source.matrix_world.to_quaternion()
+    source_world_q_inv = source_world_q.inverted()
+    target_world_q = target.matrix_world.to_quaternion()
+    overrides: dict[str, Matrix] = {}
+    for pair in rotation_pairs:
+        source_bone = source.data.bones[pair.source]
+        target_bone = target.data.bones[pair.target]
+        source_rest_world_q = source_world_q @ source_bone.matrix_local.to_quaternion()
+        target_rest_world_q = target_world_q @ target_bone.matrix_local.to_quaternion()
+        if pair.role in _DIRECTION_ALIGNED_ROLES:
+            rest_offset = source_rest_world_q.inverted() @ target_rest_world_q
+            roll_twist = _twist_about_bone_y(rest_offset)
+            override_world_q = target_rest_world_q @ roll_twist.inverted()
+        else:
+            override_world_q = source_rest_world_q
+
+        override_arm_q = source_world_q_inv @ override_world_q
+        overrides[pair.source] = Matrix.LocRotScale(
+            source_bone.matrix_local.translation,
+            override_arm_q,
+            source_bone.matrix_local.to_scale(),
+        )
+    return overrides
+
+
+def _install_blendcap_rest_override(source_rest_override: dict[str, Matrix]):
+    """Temporarily route one synchronous BlendCap bake through our rest map."""
+    module = _blendcap_operator_module()
+    if module is None:
+        raise RuntimeError("未找到兼容的 BlendCap 1.0.5 重定向引擎")
+    original = module._matrix_bake_pairs_iter
+    source_rest_override_map = source_rest_override
+
+    def bridge_bake_pairs_iter(
+        pairs,
+        source,
+        target,
+        frame_start,
+        frame_end,
+        mapped_bones=None,
+        source_rest_override=None,
+        override_rotation_only=True,
+    ):
+        return original(
+            pairs,
+            source,
+            target,
+            frame_start,
+            frame_end,
+            mapped_bones=mapped_bones,
+            source_rest_override=source_rest_override_map,
+            override_rotation_only=True,
+        )
+
+    module._matrix_bake_pairs_iter = bridge_bake_pairs_iter
+    return module, original
+
+
+def _restore_blendcap_rest_override(patch_state) -> None:
+    if patch_state is None:
+        return
+    module, original = patch_state
+    module._matrix_bake_pairs_iter = original
 
 
 def _activate_target(context, target) -> None:
@@ -967,8 +1198,8 @@ def _restore_source_action(scene, source, state: dict) -> None:
 
 class BAM_OT_auto_map(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.auto_map"
-    bl_label = "自动映射官方骨架 → MMD"
-    bl_description = "识别官方 SOMA 骨架语义并检查 MMD 主链；只生成 Bridge 内部映射，不改 BlendCap 当前表"
+    bl_label = "自动映射官方骨架 → 角色"
+    bl_description = "识别官方 SOMA 骨架与 MMD/Auto-Rig Pro 目标主链；只生成 Bridge 内部映射，不改 BlendCap 当前表"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -986,8 +1217,8 @@ class BAM_OT_auto_map(bpy.types.Operator):
 
 class BAM_OT_prepare_from_proscenium(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.prepare_from_proscenium"
-    bl_label = "自动准备 MMD 输出"
-    bl_description = "读取 Proscenium 官方骨架、自动寻找最佳 MMD 目标并完成高置信度映射检查"
+    bl_label = "自动准备角色输出"
+    bl_description = "读取 Proscenium 官方骨架、自动寻找最佳 MMD/Auto-Rig Pro 目标并完成高置信度映射检查"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1014,7 +1245,7 @@ class BAM_OT_prepare_from_proscenium(bpy.types.Operator):
 class BAM_OT_validate_mapping(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.validate_mapping"
     bl_label = "检查映射"
-    bl_description = "重新检查官方骨架签名、MMD 主链覆盖率、层级和对象缩放"
+    bl_description = "重新检查官方骨架签名、目标配置、主链覆盖率、层级和对象缩放"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
@@ -1029,7 +1260,7 @@ class BAM_OT_validate_mapping(bpy.types.Operator):
 
 class BAM_OT_retarget(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.retarget"
-    bl_label = "一键重定向到 MMD"
+    bl_label = "一键重定向到角色"
     bl_description = (
         "自动映射并调用 BlendCap 的世界空间 rest-pose bake；先新建独立 Action，"
         "再以可精确恢复的窄范围 FK-safe 事务保护 MMD 腿链"
@@ -1074,6 +1305,8 @@ class BAM_OT_retarget(bpy.types.Operator):
         previous_use_nla = False
         before_actions: set[int] = set()
         constraint_rows: list[dict] = []
+        switch_rows_before_attempt = _target_switch_snapshot(target)
+        rest_override_patch = None
         disabled_constraints = 0
         created_action = None
         source_motion = "Proscenium_Motion"
@@ -1110,6 +1343,8 @@ class BAM_OT_retarget(bpy.types.Operator):
             _bind_action(animation_data, None)
             animation_data.use_nla = False
 
+            source_rest_override = _build_source_rest_override(source, target, result)
+            rest_override_patch = _install_blendcap_rest_override(source_rest_override)
             bake_result = bpy.ops.blendcap.apply_retarget("EXEC_DEFAULT")
             created_action = animation_data.action
             if bake_result != {"FINISHED"} or created_action is None:
@@ -1122,6 +1357,7 @@ class BAM_OT_retarget(bpy.types.Operator):
             created_action["bam_source_object"] = source.name
             created_action["bam_target_object"] = target.name
             created_action["bam_mapping_signature"] = settings.mapping_signature
+            created_action["bam_target_profile"] = result.target_profile
             created_action["bam_previous_action"] = previous_action.name if previous_action else ""
             created_action["bam_previous_action_slot"] = previous_action_slot_identifier
             created_action["bam_previous_use_nla"] = bool(previous_use_nla)
@@ -1136,6 +1372,10 @@ class BAM_OT_retarget(bpy.types.Operator):
             new_snapshot_written = bool(constraint_rows)
             settings.last_output_action = created_action.name
             if not settings.previous_target_state_available:
+                settings.target_switch_snapshot_json = json.dumps(
+                    switch_rows_before_attempt, ensure_ascii=False
+                )
+                settings.target_switch_snapshot_target = target.name
                 settings.previous_target_state_available = True
                 settings.previous_target_rig = target
                 settings.previous_target_action = previous_action
@@ -1147,13 +1387,19 @@ class BAM_OT_retarget(bpy.types.Operator):
             settings.status_code = "RETARGET_COMPLETE"
             settings.next_action = "预览结果；需要回到角色原状态时点击恢复按钮"
             settings.status_message = (
-                f"完成：{created_action.name}；暂时关闭 {disabled_constraints} 个相关约束"
+                f"完成：{created_action.name}；{result.target_profile}；"
+                f"暂时关闭 {disabled_constraints} 个相关约束"
             )
             success = True
         except Exception as exc:
             error_message = str(exc)
             if constraint_rows:
                 _restore_constraint_rows(target, constraint_rows)
+            _restored_switches, missing_switches = _restore_target_switch_rows(
+                target, switch_rows_before_attempt
+            )
+            if missing_switches:
+                error_message += f"；{missing_switches} 个 IK/FK 状态无法恢复"
             failed_action = animation_data.action if animation_data is not None else None
             if animation_data is not None:
                 try:
@@ -1180,6 +1426,7 @@ class BAM_OT_retarget(bpy.types.Operator):
                 error_message += f"；BlendCap 映射回滚失败：{restore_exc}"
         finally:
             try:
+                _restore_blendcap_rest_override(rest_override_patch)
                 if source_state is not None:
                     _restore_source_action(scene, source, source_state)
             finally:
@@ -1207,10 +1454,10 @@ class BAM_OT_retarget(bpy.types.Operator):
 
 class BAM_OT_accept_and_retarget(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.accept_and_retarget"
-    bl_label = "接受并一键输出到 MMD"
+    bl_label = "接受并一键输出到角色"
     bl_description = (
-        "若 Proscenium 正在预览则先接受动作，再自动识别官方骨架和 MMD 目标、"
-        "检查映射并生成独立 MMD Action"
+        "若 Proscenium 正在预览则先接受动作，再自动识别官方骨架和角色目标、"
+        "检查映射并生成独立角色 Action"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -1245,22 +1492,22 @@ class BAM_OT_accept_and_retarget(bpy.types.Operator):
             result = bpy.ops.ba_motion_bridge.retarget("EXEC_DEFAULT")
         except (AttributeError, RuntimeError) as exc:
             suffix = "；已接受的 Proscenium 动作仍保留" if accepted else ""
-            self.report({"ERROR"}, f"MMD 输出失败：{exc}{suffix}")
+            self.report({"ERROR"}, f"角色输出失败：{exc}{suffix}")
             return {"CANCELLED"}
         if result != {"FINISHED"}:
             suffix = "；已接受的 Proscenium 动作仍保留" if accepted else ""
-            self.report({"ERROR"}, f"MMD 输出未完成：{result}{suffix}")
+            self.report({"ERROR"}, f"角色输出未完成：{result}{suffix}")
             return {"CANCELLED"}
         self.report(
             {"INFO"},
-            "已接受预览并输出独立 MMD Action" if accepted else "已输出独立 MMD Action",
+            "已接受预览并输出独立角色 Action" if accepted else "已输出独立角色 Action",
         )
         return {"FINISHED"}
 
 
 class BAM_OT_activate_output(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.activate_output"
-    bl_label = "激活上次 MMD 输出"
+    bl_label = "激活上次角色输出"
     bl_description = "把上次桥接生成的独立 Action 重新设为目标骨架的活动动作"
     bl_options = {"REGISTER", "UNDO"}
 
@@ -1283,6 +1530,7 @@ class BAM_OT_activate_output(bpy.types.Operator):
         try:
             _bind_action(animation_data, action)
             animation_data.use_nla = False
+            _force_target_fk_switches(target)
         except (AttributeError, RuntimeError, TypeError) as exc:
             self.report({"ERROR"}, f"激活输出失败：{exc}")
             return {"CANCELLED"}
@@ -1352,6 +1600,9 @@ class BAM_OT_restore_previous_target_animation(bpy.types.Operator):
             animation_data.use_nla = bool(settings.previous_target_use_nla)
             if previous_action is not None:
                 previous_action.use_fake_user = bool(settings.previous_target_action_fake_user)
+            restored_switches, missing_switches = _restore_saved_target_switches(settings, target)
+            if missing_switches:
+                raise RuntimeError(f"{missing_switches} 个 IK/FK 状态无法精确恢复")
         except (AttributeError, ReferenceError, RuntimeError, TypeError) as exc:
             self.report({"ERROR"}, f"切回目标动画失败：{exc}")
             return {"CANCELLED"}
@@ -1361,7 +1612,10 @@ class BAM_OT_restore_previous_target_animation(bpy.types.Operator):
         settings.previous_target_action = None
         settings.previous_target_action_name = ""
         settings.previous_target_action_slot = ""
-        settings.status_message = "已切回重定向前的目标动画；桥接输出仍保留在 Action 数据块中"
+        switch_note = f"，恢复 {restored_switches} 个 IK/FK 状态" if restored_switches else ""
+        settings.status_message = (
+            f"已切回重定向前的目标动画{switch_note}；桥接输出仍保留在 Action 数据块中"
+        )
         self.report({"INFO"}, settings.status_message)
         return {"FINISHED"}
 
@@ -1500,7 +1754,7 @@ class BAM_OT_cleanup_temporary(bpy.types.Operator):
         removed_objects = 0
         for action in tuple(bpy.data.actions):
             if (
-                action.get(OWNER_KEY) == OWNER_VALUE
+                action.get(OWNER_KEY) in OWNER_VALUES
                 and action.get(TEMPORARY_KEY) is True
                 and action.users == 0
             ):
@@ -1508,7 +1762,7 @@ class BAM_OT_cleanup_temporary(bpy.types.Operator):
                 removed_actions += 1
         for obj in tuple(bpy.data.objects):
             if (
-                obj.get(OWNER_KEY) == OWNER_VALUE
+                obj.get(OWNER_KEY) in OWNER_VALUES
                 and obj.get(TEMPORARY_KEY) is True
             ):
                 # Objects linked to a temporary collection normally have a

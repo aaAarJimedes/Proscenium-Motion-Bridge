@@ -37,6 +37,7 @@ class MappingResult:
     critical_missing: tuple[str, ...]
     warnings: tuple[str, ...]
     expected_count: int
+    target_profile: str = "MMD"
 
     @property
     def matched_count(self) -> int:
@@ -253,6 +254,128 @@ def _canonical_source_roles(source_names: set[str]) -> dict[str, str]:
     }
 
 
+_ARP_SIGNATURE = frozenset(
+    {
+        "c_root.x",
+        "c_spine_01.x",
+        "c_spine_03.x",
+        "c_arm_fk.l",
+        "c_arm_fk.r",
+        "c_thigh_fk.l",
+        "c_thigh_fk.r",
+    }
+)
+
+
+def is_auto_rig_pro_bones(names) -> bool:
+    """Return True for an Auto-Rig Pro controller rig.
+
+    MMD characters are often converted to ARP while retaining their MMD mesh
+    and naming history.  The deform/mechanism bones on such rigs must not be
+    treated as ordinary MMD FK bones: they are constraint outputs.  BlendCap's
+    own ARP preset targets the user-facing ``c_*_fk`` controls instead.
+    """
+    return _ARP_SIGNATURE.issubset(set(names))
+
+
+def _build_arp_mapping(
+    source: dict[str, str],
+    target_names: set[str],
+    root_motion_mode: str,
+) -> MappingResult:
+    expected_count = 22 + (2 if root_motion_mode == "FULL" else 0)
+    warnings = [
+        "检测到 Auto-Rig Pro 控制器；已映射到 c_* FK 控制链并由 BlendCap 切换为 FK，避免写入受约束的内部变形骨"
+    ]
+    missing: list[str] = []
+    critical_missing: list[str] = []
+    pairs: list[MappingPair] = []
+
+    def add(
+        role: str,
+        source_role: str,
+        target_name: str,
+        *,
+        channels: str = "ROT",
+        axes: str = "XYZ",
+        critical: bool = True,
+        label: str | None = None,
+    ) -> None:
+        if target_name not in target_names:
+            readable = label or role
+            missing.append(readable)
+            if critical:
+                critical_missing.append(readable)
+            return
+        pairs.append(
+            MappingPair(
+                source=source[source_role],
+                target=target_name,
+                channels=channels,
+                axes=axes,
+                role=role,
+            )
+        )
+
+    # This profile follows BlendCap 1.0.5's verified Auto-Rig Pro preset.
+    # Source Spine1/Spine2/Chest are the three SOMA torso segments.
+    add("spine_0", "spine_low", "c_spine_01.x", label="ARP 脊柱 1")
+    add("spine_1", "spine_mid", "c_spine_02.x", label="ARP 脊柱 2")
+    add("spine_2", "chest", "c_spine_03.x", label="ARP 胸部")
+    add("neck", "neck", "c_neck.x", label="ARP 颈部")
+    add("head", "head", "c_head.x", label="ARP 头部")
+    add("hips_rotation", "hips", "c_root.x", label="ARP 骨盆旋转")
+
+    limb_targets = {
+        "left_shoulder": "c_shoulder.l",
+        "left_upper_arm": "c_arm_fk.l",
+        "left_forearm": "c_forearm_fk.l",
+        "left_hand": "c_hand_fk.l",
+        "left_thigh": "c_thigh_fk.l",
+        "left_shin": "c_leg_fk.l",
+        "left_foot": "c_foot_fk.l",
+        "left_toe": "c_toes_fk.l",
+        "right_shoulder": "c_shoulder.r",
+        "right_upper_arm": "c_arm_fk.r",
+        "right_forearm": "c_forearm_fk.r",
+        "right_hand": "c_hand_fk.r",
+        "right_thigh": "c_thigh_fk.r",
+        "right_shin": "c_leg_fk.r",
+        "right_foot": "c_foot_fk.r",
+        "right_toe": "c_toes_fk.r",
+    }
+    for role, target_name in limb_targets.items():
+        optional = role.endswith("_shoulder") or role.endswith("_toe")
+        add(role, role, target_name, critical=not optional, label=f"ARP {role}")
+
+    if root_motion_mode == "FULL":
+        add(
+            "root_xy",
+            "hips",
+            "c_pos",
+            channels="LOC",
+            axes="XY",
+            label="ARP 水平位移控制",
+        )
+        add(
+            "root_z",
+            "hips",
+            "c_root_master.x",
+            channels="LOC",
+            axes="Z",
+            label="ARP 垂直位移控制",
+        )
+
+    return MappingResult(
+        pairs=tuple(pairs),
+        missing=tuple(missing),
+        critical_missing=tuple(critical_missing),
+        warnings=tuple(warnings),
+        expected_count=expected_count,
+        target_profile="AUTO_RIG_PRO",
+    )
+
+
 def build_mapping(source_rig, target_rig, root_motion_mode: str = "FULL") -> MappingResult:
     source_names = {bone.name for bone in source_rig.data.bones}
     source = _canonical_source_roles(source_names)
@@ -272,6 +395,9 @@ def build_mapping(source_rig, target_rig, root_motion_mode: str = "FULL") -> Map
         )
 
     target_records = records_from_rig(target_rig)
+    target_names = {record.name for record in target_records}
+    if is_auto_rig_pro_bones(target_names):
+        return _build_arp_mapping(source, target_names, root_motion_mode)
     lookup = _lookup(target_records)
     parents = {record.name: record.parent for record in target_records}
 
@@ -444,4 +570,5 @@ def build_mapping(source_rig, target_rig, root_motion_mode: str = "FULL") -> Map
         critical_missing=tuple(dict.fromkeys(critical_missing)),
         warnings=tuple(dict.fromkeys(warnings)),
         expected_count=expected_count,
+        target_profile="MMD",
     )

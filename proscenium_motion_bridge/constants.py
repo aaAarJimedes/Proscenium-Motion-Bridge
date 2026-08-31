@@ -1,9 +1,10 @@
-ADDON_VERSION = (0, 2, 0)
+ADDON_VERSION = (0, 3, 1)
 
-TOOL_ID = "ba_motion_bridge"
-TOOL_NAME = "BA Motion Bridge"
+TOOL_ID = "proscenium_motion_bridge"
+TOOL_NAME = "Proscenium Motion Bridge"
 OWNER_KEY = "bam_owner"
 OWNER_VALUE = TOOL_ID
+OWNER_VALUES = frozenset({TOOL_ID, "ba_motion_bridge"})
 TEMPORARY_KEY = "bam_temporary"
 
 CANONICAL_MODEL_KEY = "proscenium_canonical_model"
