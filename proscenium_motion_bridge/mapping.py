@@ -240,7 +240,7 @@ def _canonical_source_roles(source_names: set[str]) -> dict[str, str]:
         "right_upper_arm": "RightArm",
         "right_forearm": "RightForeArm",
         "right_hand": "RightHand",
-        # SOMA differs from BlendCap BVH here: LeftLeg is the thigh and
+        # SOMA differs from common BVH naming here: LeftLeg is the thigh and
         # LeftShin is the lower leg. Never feed this profile through the
         # legacy LeftUpLeg/LeftLeg mapper.
         "left_thigh": "LeftLeg",
@@ -272,8 +272,8 @@ def is_auto_rig_pro_bones(names) -> bool:
 
     MMD characters are often converted to ARP while retaining their MMD mesh
     and naming history.  The deform/mechanism bones on such rigs must not be
-    treated as ordinary MMD FK bones: they are constraint outputs.  BlendCap's
-    own ARP preset targets the user-facing ``c_*_fk`` controls instead.
+    treated as ordinary MMD FK bones: they are constraint outputs.  The
+    dedicated profile therefore targets the user-facing ``c_*_fk`` controls.
     """
     return _ARP_SIGNATURE.issubset(set(names))
 
@@ -285,7 +285,7 @@ def _build_arp_mapping(
 ) -> MappingResult:
     expected_count = 22 + (2 if root_motion_mode == "FULL" else 0)
     warnings = [
-        "检测到 Auto-Rig Pro 控制器；已映射到 c_* FK 控制链并由 BlendCap 切换为 FK，避免写入受约束的内部变形骨"
+        "检测到 Auto-Rig Pro 控制器；已映射到 c_* FK 控制链并切换为 FK，避免写入受约束的内部变形骨"
     ]
     missing: list[str] = []
     critical_missing: list[str] = []
@@ -317,7 +317,7 @@ def _build_arp_mapping(
             )
         )
 
-    # This profile follows BlendCap 1.0.5's verified Auto-Rig Pro preset.
+    # This profile targets Auto-Rig Pro's verified public FK controls.
     # Source Spine1/Spine2/Chest are the three SOMA torso segments.
     add("spine_0", "spine_low", "c_spine_01.x", label="ARP 脊柱 1")
     add("spine_1", "spine_mid", "c_spine_02.x", label="ARP 脊柱 2")
@@ -532,9 +532,8 @@ def build_mapping(source_rig, target_rig, root_motion_mode: str = "FULL") -> Map
             label="中心垂直位移",
         )
 
-    # Stable order: target parent chains first, then limbs/head/root. BlendCap
-    # independently topologically sorts targets during bake, but a stable UI
-    # table makes validation and regression reports deterministic.
+    # Stable order keeps validation and regression reports deterministic; the
+    # native bake engine independently sorts targets by hierarchy depth.
     unique_keys: set[tuple[str, str, str, str]] = set()
     unique_pairs: list[MappingPair] = []
     for pair in pairs:

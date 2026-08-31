@@ -145,11 +145,6 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
     target_profile: StringProperty(default="", options={"HIDDEN"})
     mapping_json: StringProperty(default="", options={"HIDDEN"})
     mapping_signature: StringProperty(default="", options={"HIDDEN"})
-    bridge_owns_current_table: BoolProperty(default=False, options={"HIDDEN"})
-    previous_blendcap_mapping_json: StringProperty(default="", options={"HIDDEN"})
-    previous_blendcap_state_json: StringProperty(default="", options={"HIDDEN"})
-    previous_blendcap_source: StringProperty(default="", options={"HIDDEN"})
-    previous_blendcap_target: StringProperty(default="", options={"HIDDEN"})
     constraint_snapshot_json: StringProperty(default="", options={"HIDDEN"})
     constraint_snapshot_target: StringProperty(default="", options={"HIDDEN"})
     constraint_snapshot_target_rig: PointerProperty(

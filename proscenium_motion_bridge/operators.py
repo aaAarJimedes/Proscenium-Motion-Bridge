@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
 import re
 import statistics
-import sys
 
 import bpy
 from bpy.props import EnumProperty
@@ -20,6 +18,7 @@ from .constants import (
     TEMPORARY_KEY,
 )
 from .mapping import MappingResult, build_mapping, is_official_canonical_bones, normalize
+from .retarget import bake_retarget
 
 
 def operator_available(path: str) -> bool:
@@ -30,71 +29,6 @@ def operator_available(path: str) -> bool:
     except (AttributeError, KeyError, RuntimeError):
         return False
     return True
-
-
-def blendcap_ready() -> bool:
-    return (
-        hasattr(bpy.types.Scene, "blendcap_retarget_source")
-        and hasattr(bpy.types.Scene, "blendcap_retarget_target")
-        and hasattr(bpy.types.Scene, "blendcap_retarget_pairs")
-        and operator_available("blendcap.apply_retarget")
-    )
-
-
-def blendcap_motion_bridge_ready() -> bool:
-    return operator_available("blendcap_motion_bridge.apply_retarget_fk_safe")
-
-
-def _blendcap_classic_engine_module():
-    """Return BlendCap's version-locked engine module when available.
-
-    BlendCap 1.0.5 ships the classic depsgraph evaluator behind a module
-    switch. It is slower than the fcurve-direct default, but it evaluates
-    accepted NLA and MMD TRANSFORM constraints exactly. We change the switch
-    only for the synchronous transaction and always restore it afterward.
-    """
-    modules = [addon.module for addon in bpy.context.preferences.addons]
-    base = next((name for name in modules if name.rsplit(".", 1)[-1] == "blendcap"), None)
-    if base is not None:
-        try:
-            module = importlib.import_module(base + ".blendcap.retarget.bake_fk")
-        except ImportError:
-            module = None
-        if module is not None and hasattr(module, "USE_FAST_ENGINE"):
-            return module
-    # Source-tree regression tests register BlendCap without an extension
-    # preference entry. The same module is already present in that case.
-    return next(
-        (
-            module
-            for name, module in tuple(sys.modules.items())
-            if name.endswith("blendcap.retarget.bake_fk")
-            and hasattr(module, "USE_FAST_ENGINE")
-        ),
-        None,
-    )
-
-
-def _blendcap_operator_module():
-    """Return the loaded BlendCap retarget operator implementation."""
-    modules = [addon.module for addon in bpy.context.preferences.addons]
-    base = next((name for name in modules if name.rsplit(".", 1)[-1] == "blendcap"), None)
-    if base is not None:
-        try:
-            module = importlib.import_module(base + ".blendcap.operators_retarget")
-        except ImportError:
-            module = None
-        if module is not None and hasattr(module, "_matrix_bake_pairs_iter"):
-            return module
-    return next(
-        (
-            module
-            for name, module in tuple(sys.modules.items())
-            if name.endswith("blendcap.operators_retarget")
-            and hasattr(module, "_matrix_bake_pairs_iter")
-        ),
-        None,
-    )
 
 
 def _is_armature(obj) -> bool:
@@ -218,7 +152,6 @@ def _auto_target(scene, settings, source):
 
     preferred = (
         ("活动对象", bpy.context.active_object),
-        ("BlendCap 当前目标", getattr(scene, "blendcap_retarget_target", None) if blendcap_ready() else None),
     )
     for origin, candidate in preferred:
         result = _candidate_result(source, candidate, settings.root_motion_mode)
@@ -405,187 +338,7 @@ def _set_failure(settings, code: str, message: str, next_action: str) -> None:
     settings.next_action = next_action
 
 
-def _json_scalar(value):
-    if isinstance(value, (str, bool, int, float)) or value is None:
-        return value
-    return None
-
-
-def _serialize_blendcap_pair(pair) -> dict:
-    result = {}
-    for prop in pair.bl_rna.properties:
-        identifier = prop.identifier
-        if identifier == "rna_type" or prop.is_readonly or prop.type in {"COLLECTION", "POINTER"}:
-            continue
-        try:
-            value = _json_scalar(getattr(pair, identifier))
-        except (AttributeError, RuntimeError, TypeError):
-            continue
-        if value is not None:
-            result[identifier] = value
-    return result
-
-
-_BLENDCAP_TRANSACTION_FIELDS = (
-    "blendcap_retarget_source",
-    "blendcap_retarget_target",
-    "blendcap_retarget_preset",
-    "blendcap_retarget_source_prefix",
-    "blendcap_retarget_namespace_strip",
-    "blendcap_retarget_auto_scale",
-    "blendcap_retarget_use_world_location",
-    "blendcap_retarget_use_current_pose_as_rest",
-    "blendcap_retarget_current_pose_full_matrix",
-    "blendcap_retarget_auto_bake_ik",
-    "blendcap_motion_bridge_matched",
-    "blendcap_motion_bridge_total",
-    "blendcap_motion_bridge_unmatched",
-    "blendcap_motion_bridge_hips_target",
-)
-
-
-def _capture_blendcap_state(scene, settings) -> dict:
-    state = {
-        "scene": {
-            name: getattr(scene, name)
-            for name in _BLENDCAP_TRANSACTION_FIELDS
-            if hasattr(scene, name)
-        },
-        "pairs": [
-            _serialize_blendcap_pair(pair)
-            for pair in getattr(scene, "blendcap_retarget_pairs", ())
-        ],
-        "settings": {
-            "bridge_owns_current_table": bool(settings.bridge_owns_current_table),
-            "previous_blendcap_mapping_json": settings.previous_blendcap_mapping_json,
-            "previous_blendcap_state_json": settings.previous_blendcap_state_json,
-            "previous_blendcap_source": settings.previous_blendcap_source,
-            "previous_blendcap_target": settings.previous_blendcap_target,
-        },
-    }
-    blendcap_props = getattr(scene, "blendcap_props", None)
-    if blendcap_props is not None and hasattr(blendcap_props, "use_custom_rest_pose"):
-        state["use_custom_rest_pose"] = bool(blendcap_props.use_custom_rest_pose)
-    return state
-
-
-def _restore_blendcap_state(scene, settings, state: dict) -> None:
-    scene_values = state.get("scene", {})
-    # Pointer/preset updates can internally reload a preset. Restore every
-    # callback-bearing field first and rebuild the exact pair table last.
-    for name, value in scene_values.items():
-        _assign_if_present(scene, name, value)
-    pairs = getattr(scene, "blendcap_retarget_pairs", None)
-    if pairs is not None:
-        pairs.clear()
-        for row in state.get("pairs", ()):
-            item = pairs.add()
-            for name, value in row.items():
-                _assign_if_present(item, name, value)
-    blendcap_props = getattr(scene, "blendcap_props", None)
-    if blendcap_props is not None and "use_custom_rest_pose" in state:
-        _assign_if_present(
-            blendcap_props,
-            "use_custom_rest_pose",
-            state["use_custom_rest_pose"],
-        )
-    for name, value in state.get("settings", {}).items():
-        setattr(settings, name, value)
-
-
-def _snapshot_previous_mapping(scene, settings) -> None:
-    if settings.bridge_owns_current_table or settings.previous_blendcap_state_json:
-        return
-    pairs = getattr(scene, "blendcap_retarget_pairs", None)
-    if pairs is None:
-        return
-    rows = [_serialize_blendcap_pair(pair) for pair in pairs]
-    settings.previous_blendcap_mapping_json = json.dumps(rows, ensure_ascii=False)
-    source = getattr(scene, "blendcap_retarget_source", None)
-    target = getattr(scene, "blendcap_retarget_target", None)
-    settings.previous_blendcap_source = source.name if source else ""
-    settings.previous_blendcap_target = target.name if target else ""
-    scene_state = {}
-    for name in _BLENDCAP_TRANSACTION_FIELDS:
-        if not hasattr(scene, name):
-            continue
-        value = getattr(scene, name)
-        if isinstance(value, bpy.types.Object):
-            scene_state[name] = {"object": value.name}
-        elif value is None and name in {"blendcap_retarget_source", "blendcap_retarget_target"}:
-            scene_state[name] = {"object": None}
-        else:
-            scalar = _json_scalar(value)
-            if scalar is not None:
-                scene_state[name] = scalar
-    blendcap_props = getattr(scene, "blendcap_props", None)
-    settings.previous_blendcap_state_json = json.dumps(
-        {
-            "schema": 1,
-            "scene": scene_state,
-            "pairs": rows,
-            "use_custom_rest_pose": (
-                bool(blendcap_props.use_custom_rest_pose)
-                if blendcap_props is not None and hasattr(blendcap_props, "use_custom_rest_pose")
-                else None
-            ),
-        },
-        ensure_ascii=False,
-    )
-
-
-def _assign_if_present(owner, name: str, value) -> None:
-    if hasattr(owner, name):
-        try:
-            setattr(owner, name, value)
-        except (AttributeError, RuntimeError, TypeError, ValueError):
-            pass
-
-
-def _write_blendcap_mapping(scene, settings, source, target, result: MappingResult) -> None:
-    _snapshot_previous_mapping(scene, settings)
-
-    scene.blendcap_retarget_source = source
-    scene.blendcap_retarget_target = target
-    _assign_if_present(scene, "blendcap_retarget_preset", "__UNSAVED__")
-    _assign_if_present(scene, "blendcap_retarget_source_prefix", "")
-    _assign_if_present(scene, "blendcap_retarget_namespace_strip", "")
-    # BlendCap's built-in auto-height scans every target pose bone, which is
-    # unstable for MMD rigs containing tall hair, weapons, wings, or effects.
-    # We instead put a semantic body-landmark median on the two LOC pairs.
-    _assign_if_present(scene, "blendcap_retarget_auto_scale", False)
-    _assign_if_present(scene, "blendcap_retarget_use_world_location", settings.world_location)
-    # The Bridge injects an explicit, in-memory source-rest override into the
-    # synchronous BlendCap bake. Do not sample or mutate the visible source
-    # pose: the current frame is animation data, not a trustworthy rest pose.
-    _assign_if_present(scene, "blendcap_retarget_use_current_pose_as_rest", False)
-    _assign_if_present(scene, "blendcap_retarget_current_pose_full_matrix", False)
-    _assign_if_present(scene, "blendcap_retarget_auto_bake_ik", False)
-
-    blendcap_props = getattr(scene, "blendcap_props", None)
-    if blendcap_props is not None:
-        _assign_if_present(blendcap_props, "use_custom_rest_pose", False)
-
-    scene.blendcap_retarget_pairs.clear()
-    for pair in result.pairs:
-        item = scene.blendcap_retarget_pairs.add()
-        item.source = pair.source
-        item.target = pair.target
-        item.channels = pair.channels
-        item.axes = pair.axes
-        item.influence = pair.influence
-        if pair.channels == "LOC" and hasattr(item, "loc_scale"):
-            item.loc_scale = settings.scale_ratio if settings.auto_scale else 1.0
-
-    _assign_if_present(scene, "blendcap_motion_bridge_matched", result.matched_count)
-    _assign_if_present(scene, "blendcap_motion_bridge_total", result.expected_count)
-    _assign_if_present(scene, "blendcap_motion_bridge_unmatched", ", ".join(result.missing))
-    hips = next((pair.target for pair in result.pairs if pair.role == "hips_rotation"), "")
-    _assign_if_present(scene, "blendcap_motion_bridge_hips_target", hips)
-    settings.bridge_owns_current_table = True
-
-
-def _prepare_mapping(scene, settings, write_table: bool):
+def _prepare_mapping(scene, settings):
     source, target = _resolve_rigs(scene, settings)
     if source is None:
         if settings.source_candidates:
@@ -640,12 +393,6 @@ def _prepare_mapping(scene, settings, write_table: bool):
         message = f"关键骨缺失：{'、'.join(result.critical_missing)}"
     _set_status(settings, result, valid, message)
 
-    if write_table and valid:
-        if not blendcap_ready():
-            message = "BlendCap 未启用，无法执行世界空间重定向"
-            _set_failure(settings, "BLENDCAP_MISSING", message, "启用 BlendCap 1.0.5 后重试")
-            return source, target, result, message
-        _write_blendcap_mapping(scene, settings, source, target, result)
     return source, target, result, None if valid else message
 
 
@@ -712,11 +459,9 @@ def _mapped_constraint_snapshot(target, result: MappingResult) -> list[dict]:
         "left_thigh",
         "left_shin",
         "left_foot",
-        "left_toe",
         "right_thigh",
         "right_shin",
         "right_foot",
-        "right_toe",
     }
     leg_bones = {by_role[role] for role in leg_roles if role in by_role}
     hips = by_role.get("hips_rotation")
@@ -782,7 +527,7 @@ _TARGET_SWITCH_KEYS = ("IK_FK", "ik_fk_switch")
 
 
 def _target_switch_snapshot(target) -> list[dict]:
-    """Capture rig-level FK/IK properties changed by BlendCap's bake setup."""
+    """Capture rig-level FK/IK properties changed by the native bake setup."""
     rows: list[dict] = []
     for pose_bone in target.pose.bones:
         for key in _TARGET_SWITCH_KEYS:
@@ -862,7 +607,6 @@ _DIRECTION_ALIGNED_ROLES = frozenset(
         "left_thigh",
         "left_shin",
         "left_foot",
-        "left_toe",
         "right_shoulder",
         "right_upper_arm",
         "right_forearm",
@@ -870,7 +614,6 @@ _DIRECTION_ALIGNED_ROLES = frozenset(
         "right_thigh",
         "right_shin",
         "right_foot",
-        "right_toe",
     }
 )
 
@@ -885,13 +628,16 @@ def _twist_about_bone_y(rotation: Quaternion) -> Quaternion:
 
 
 def _build_source_rest_override(source, target, result: MappingResult) -> dict[str, Matrix]:
-    """Build BlendCap rest matrices with limb direction swing removed.
+    """Build source rest matrices with selected limb direction swing removed.
 
     The canonical source rests in a T-pose while many converted MMD/ARP rigs
-    rest with their arms sloping down. BlendCap normally preserves that rest
+    rest with their arms sloping down. Ordinary delta transfer preserves that
     direction offset, which rotates a two-handed gun pose inward and causes
     the arms to cross. For limb pairs we retain only the offset's local-Y
     twist (bone roll); torso/head/hips use the ordinary source edit rest.
+    ToeBase is deliberately excluded: SOMA uses it for the foot dorsum while
+    MMD つま先 represents the forward toe tip. Strict delta-from-rest transfer
+    keeps MMD toes neutral instead of copying SOMA's upward rest direction.
     """
     rotation_pairs = []
     seen_sources = set()
@@ -925,46 +671,6 @@ def _build_source_rest_override(source, target, result: MappingResult) -> dict[s
             source_bone.matrix_local.to_scale(),
         )
     return overrides
-
-
-def _install_blendcap_rest_override(source_rest_override: dict[str, Matrix]):
-    """Temporarily route one synchronous BlendCap bake through our rest map."""
-    module = _blendcap_operator_module()
-    if module is None:
-        raise RuntimeError("未找到兼容的 BlendCap 1.0.5 重定向引擎")
-    original = module._matrix_bake_pairs_iter
-    source_rest_override_map = source_rest_override
-
-    def bridge_bake_pairs_iter(
-        pairs,
-        source,
-        target,
-        frame_start,
-        frame_end,
-        mapped_bones=None,
-        source_rest_override=None,
-        override_rotation_only=True,
-    ):
-        return original(
-            pairs,
-            source,
-            target,
-            frame_start,
-            frame_end,
-            mapped_bones=mapped_bones,
-            source_rest_override=source_rest_override_map,
-            override_rotation_only=True,
-        )
-
-    module._matrix_bake_pairs_iter = bridge_bake_pairs_iter
-    return module, original
-
-
-def _restore_blendcap_rest_override(patch_state) -> None:
-    if patch_state is None:
-        return
-    module, original = patch_state
-    module._matrix_bake_pairs_iter = original
 
 
 def _activate_target(context, target) -> None:
@@ -1413,15 +1119,14 @@ def _prepare_source_action(scene, source, *, evaluate_nla: bool = False) -> dict
     if not strips:
         raise RuntimeError("官方骨架没有可用 Action 或 NLA 条带")
     if evaluate_nla:
-        # BlendCap Classic evaluates the depsgraph, so accepted/combined NLA
-        # can stay exactly as authored. No temporary Action is required.
+        # A caller may opt into direct depsgraph evaluation of accepted NLA.
         state["label"] = strips[-1].action.name
         return state
     state["changed"] = True
 
     # The common Proscenium Accept path creates one unscaled strip whose
-    # action range matches the strip range. Bind it directly so BlendCap's
-    # fcurve-direct engine reads the exact generated samples.
+    # action range matches the strip range. Bind it directly so the native
+    # engine reads the exact generated samples.
     strip = strips[0]
     action_start, action_end = strip.action.frame_range
     direct = (
@@ -1475,12 +1180,12 @@ def _restore_source_action(scene, source, state: dict) -> None:
 class BAM_OT_auto_map(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.auto_map"
     bl_label = "自动映射官方骨架 → 角色"
-    bl_description = "识别官方 SOMA 骨架与 MMD/Auto-Rig Pro 目标主链；只生成 Bridge 内部映射，不改 BlendCap 当前表"
+    bl_description = "识别官方 SOMA 骨架与 MMD/Auto-Rig Pro 目标主链；映射完全由本插件管理"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         settings = context.scene.ba_motion_bridge_settings
-        source, target, result, error = _prepare_mapping(context.scene, settings, write_table=False)
+        source, target, result, error = _prepare_mapping(context.scene, settings)
         if error:
             self.report({"ERROR"}, error)
             return {"CANCELLED"}
@@ -1506,7 +1211,7 @@ class BAM_OT_prepare_from_proscenium(bpy.types.Operator):
             settings.source_rig = hosted_source
             settings.source_origin = "Proscenium 当前骨架"
         _sync_proscenium_inplace(scene, settings)
-        source, target, result, error = _prepare_mapping(scene, settings, write_table=False)
+        source, target, result, error = _prepare_mapping(scene, settings)
         if error:
             self.report({"ERROR"}, error)
             return {"CANCELLED"}
@@ -1526,7 +1231,7 @@ class BAM_OT_validate_mapping(bpy.types.Operator):
 
     def execute(self, context):
         settings = context.scene.ba_motion_bridge_settings
-        _source, _target, result, error = _prepare_mapping(context.scene, settings, write_table=False)
+        _source, _target, result, error = _prepare_mapping(context.scene, settings)
         if error:
             self.report({"ERROR"}, error)
             return {"CANCELLED"}
@@ -1538,7 +1243,7 @@ class BAM_OT_retarget(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.retarget"
     bl_label = "一键重定向到角色"
     bl_description = (
-        "自动映射并调用 BlendCap 的世界空间 rest-pose bake；先新建独立 Action，"
+        "使用插件自有世界空间 rest-pose 烘焙器；先新建独立 Action，"
         "再以可精确恢复的窄范围 FK-safe 事务保护 MMD 腿链"
     )
     bl_options = {"REGISTER", "UNDO"}
@@ -1547,13 +1252,9 @@ class BAM_OT_retarget(bpy.types.Operator):
         scene = context.scene
         settings = scene.ba_motion_bridge_settings
         _sync_proscenium_inplace(scene, settings)
-        source, target, result, error = _prepare_mapping(scene, settings, write_table=False)
+        source, target, result, error = _prepare_mapping(scene, settings)
         if error:
             self.report({"ERROR"}, error)
-            return {"CANCELLED"}
-        if not blendcap_ready():
-            _set_failure(settings, "BLENDCAP_MISSING", "BlendCap 未启用，无法执行世界空间 rest-pose bake", "启用 BlendCap 1.0.5 后重试")
-            self.report({"ERROR"}, "BlendCap 未启用，无法执行世界空间 rest-pose bake")
             return {"CANCELLED"}
         if not _animation_present(source):
             _set_failure(settings, "MOTION_MISSING", "官方骨架没有活动 Action 或已接受的 NLA 动作", "在 Proscenium 生成并接受动作")
@@ -1570,9 +1271,6 @@ class BAM_OT_retarget(bpy.types.Operator):
                 self.report({"ERROR"}, message)
                 return {"CANCELLED"}
 
-        blendcap_state = _capture_blendcap_state(scene, settings)
-        classic_module = _blendcap_classic_engine_module()
-        previous_engine = getattr(classic_module, "USE_FAST_ENGINE", None) if classic_module else None
         source_state = None
         animation_data = None
         previous_action = None
@@ -1585,7 +1283,6 @@ class BAM_OT_retarget(bpy.types.Operator):
         switch_rows_before_attempt = _target_switch_snapshot(target)
         physics_cache_before_attempt = _physics_cache_snapshot(scene)
         timeline_before_attempt = _timeline_snapshot(scene)
-        rest_override_patch = None
         disabled_constraints = 0
         created_action = None
         initial_pose: dict[str, Matrix] = {}
@@ -1596,13 +1293,10 @@ class BAM_OT_retarget(bpy.types.Operator):
         error_message = ""
         success = False
         try:
-            if classic_module is not None:
-                classic_module.USE_FAST_ENGINE = False
-            _write_blendcap_mapping(scene, settings, source, target, result)
             source_state = _prepare_source_action(
                 scene,
                 source,
-                evaluate_nla=classic_module is not None,
+                evaluate_nla=False,
             )
             source_motion = source_state["label"]
 
@@ -1627,13 +1321,19 @@ class BAM_OT_retarget(bpy.types.Operator):
             disabled_constraints = _disable_constraint_rows(target, constraint_rows)
             _bind_action(animation_data, None)
             animation_data.use_nla = False
+            _force_target_fk_switches(target)
 
             source_rest_override = _build_source_rest_override(source, target, result)
-            rest_override_patch = _install_blendcap_rest_override(source_rest_override)
-            bake_result = bpy.ops.blendcap.apply_retarget("EXEC_DEFAULT")
-            created_action = animation_data.action
-            if bake_result != {"FINISHED"} or created_action is None:
-                raise RuntimeError(f"BlendCap bake 未完成：{bake_result}")
+            bake_result = bake_retarget(
+                scene,
+                source,
+                target,
+                result,
+                source_rest_override=source_rest_override,
+                location_scale=settings.scale_ratio if settings.auto_scale else 1.0,
+                world_location=bool(settings.world_location),
+            )
+            created_action = bake_result.action
 
             created_action.name = f"ACT_{_safe_action_name(target.name)}_{_safe_action_name(source_motion)}_MMD"
             created_action.use_fake_user = True
@@ -1646,7 +1346,7 @@ class BAM_OT_retarget(bpy.types.Operator):
             created_action["bam_previous_action"] = previous_action.name if previous_action else ""
             created_action["bam_previous_action_slot"] = previous_action_slot_identifier
             created_action["bam_previous_use_nla"] = bool(previous_use_nla)
-            created_action["bam_engine"] = "BlendCap Classic" if classic_module is not None else "BlendCap Fast"
+            created_action["bam_engine"] = "Proscenium Motion Bridge Native"
             created_action["bam_disabled_constraint_count"] = disabled_constraints
 
             if settings.use_start_buffer and (settings.settle_frames + settings.transition_frames) > 0:
@@ -1759,18 +1459,9 @@ class BAM_OT_retarget(bpy.types.Operator):
                 settings.constraint_snapshot_json = ""
                 settings.constraint_snapshot_target = ""
                 settings.constraint_snapshot_target_rig = None
-            try:
-                _restore_blendcap_state(scene, settings, blendcap_state)
-            except Exception as restore_exc:
-                error_message += f"；BlendCap 映射回滚失败：{restore_exc}"
         finally:
-            try:
-                _restore_blendcap_rest_override(rest_override_patch)
-                if source_state is not None:
-                    _restore_source_action(scene, source, source_state)
-            finally:
-                if classic_module is not None:
-                    classic_module.USE_FAST_ENGINE = previous_engine
+            if source_state is not None:
+                _restore_source_action(scene, source, source_state)
 
         if not success:
             _set_failure(
@@ -1976,84 +1667,10 @@ class BAM_OT_restore_previous_target_animation(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class BAM_OT_restore_previous_mapping(bpy.types.Operator):
-    bl_idname = "ba_motion_bridge.restore_previous_mapping"
-    bl_label = "恢复之前的 BlendCap 映射"
-    bl_description = "恢复桥接器第一次写表前的 source/target、preset、比例/rest flags 和精确骨骼对；不会写文件"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        settings = getattr(context.scene, "ba_motion_bridge_settings", None)
-        return bool(
-            settings
-            and (settings.previous_blendcap_state_json or settings.previous_blendcap_mapping_json)
-            and blendcap_ready()
-        )
-
-    def execute(self, context):
-        scene = context.scene
-        settings = scene.ba_motion_bridge_settings
-        state = None
-        if settings.previous_blendcap_state_json:
-            try:
-                state = json.loads(settings.previous_blendcap_state_json)
-            except json.JSONDecodeError as exc:
-                self.report({"ERROR"}, f"完整映射备份无效：{exc}")
-                return {"CANCELLED"}
-        try:
-            rows = state.get("pairs", []) if isinstance(state, dict) else json.loads(settings.previous_blendcap_mapping_json)
-        except json.JSONDecodeError as exc:
-            self.report({"ERROR"}, f"映射备份无效：{exc}")
-            return {"CANCELLED"}
-        if not isinstance(rows, list):
-            self.report({"ERROR"}, "映射备份格式无效")
-            return {"CANCELLED"}
-
-        if isinstance(state, dict):
-            for name, value in state.get("scene", {}).items():
-                if isinstance(value, dict) and "object" in value:
-                    object_name = value["object"]
-                    value = bpy.data.objects.get(object_name) if object_name else None
-                _assign_if_present(scene, name, value)
-            blendcap_props = getattr(scene, "blendcap_props", None)
-            custom_rest = state.get("use_custom_rest_pose")
-            if blendcap_props is not None and custom_rest is not None:
-                _assign_if_present(blendcap_props, "use_custom_rest_pose", bool(custom_rest))
-        else:
-            _assign_if_present(
-                scene,
-                "blendcap_retarget_source",
-                bpy.data.objects.get(settings.previous_blendcap_source) if settings.previous_blendcap_source else None,
-            )
-            _assign_if_present(
-                scene,
-                "blendcap_retarget_target",
-                bpy.data.objects.get(settings.previous_blendcap_target) if settings.previous_blendcap_target else None,
-            )
-        scene.blendcap_retarget_pairs.clear()
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            item = scene.blendcap_retarget_pairs.add()
-            for name, value in row.items():
-                _assign_if_present(item, name, value)
-        count = len(scene.blendcap_retarget_pairs)
-        settings.previous_blendcap_mapping_json = ""
-        settings.previous_blendcap_state_json = ""
-        settings.previous_blendcap_source = ""
-        settings.previous_blendcap_target = ""
-        settings.bridge_owns_current_table = False
-        settings.mapping_valid = False
-        settings.status_message = f"已恢复之前的 BlendCap 映射（{count} 对）"
-        self.report({"INFO"}, settings.status_message)
-        return {"FINISHED"}
-
-
 class BAM_OT_restore_previous_state(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.restore_previous_state"
     bl_label = "恢复角色原状态"
-    bl_description = "依次恢复桥接前的腿链约束、目标 Action/NLA 和 BlendCap 内存映射；输出 Action 保留"
+    bl_description = "依次恢复桥接前的腿链约束、目标 Action/NLA、时间轴和物理缓存；输出 Action 保留"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -2064,7 +1681,6 @@ class BAM_OT_restore_previous_state(bpy.types.Operator):
             and (
                 settings.constraint_snapshot_json
                 or settings.previous_target_state_available
-                or settings.previous_blendcap_mapping_json
             )
         )
 
@@ -2074,7 +1690,6 @@ class BAM_OT_restore_previous_state(bpy.types.Operator):
         steps = (
             (bool(settings.constraint_snapshot_json), "ba_motion_bridge.restore_constraints", "约束"),
             (bool(settings.previous_target_state_available), "ba_motion_bridge.restore_previous_target_animation", "目标动画"),
-            (bool(settings.previous_blendcap_mapping_json), "ba_motion_bridge.restore_previous_mapping", "BlendCap 映射"),
         )
         for needed, path, label in steps:
             if not needed:
@@ -2208,7 +1823,6 @@ CLASSES = (
     BAM_OT_activate_output,
     BAM_OT_restore_constraints,
     BAM_OT_restore_previous_target_animation,
-    BAM_OT_restore_previous_mapping,
     BAM_OT_restore_previous_state,
     BAM_OT_resolve_target_switch,
     BAM_OT_cleanup_temporary,

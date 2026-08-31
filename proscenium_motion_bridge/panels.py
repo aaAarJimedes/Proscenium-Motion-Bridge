@@ -4,7 +4,6 @@ from .operators import (
     _animation_present,
     _effective_root_motion_mode,
     _is_official_source,
-    blendcap_ready,
 )
 
 
@@ -57,15 +56,9 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         settings = context.scene.ba_motion_bridge_settings
-        dependencies_ready = blendcap_ready()
         proscenium = getattr(context.scene, "proscenium", None)
         generating = bool(proscenium and getattr(proscenium, "is_generating", False))
         previewing = bool(proscenium and getattr(proscenium, "is_previewing", False))
-
-        if not dependencies_ready:
-            dependency = layout.row()
-            dependency.alert = True
-            dependency.label(text="缺少必需重定向引擎：BlendCap 1.0.5", icon="ERROR")
 
         rigs = layout.box()
         rigs.label(text="1. 选择骨架", icon="ARMATURE_DATA")
@@ -166,8 +159,7 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
         run.scale_y = 1.5
         motion_ready = source_ready and _animation_present(settings.source_rig)
         run.enabled = (
-            dependencies_ready
-            and not generating
+            not generating
             and not target_conflict
             and (previewing or motion_ready or settings.source_rig is None)
         )
@@ -176,10 +168,10 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
             text="接受并输出到角色" if previewing else "一键输出到角色",
             icon="ACTION",
         )
-        output.label(text="静置方向补偿 · 起始缓冲 · 独立 Action · 失败回滚", icon="LOCKED")
+        output.label(text="内置重定向 · 脚趾轴修正 · 起始缓冲 · 独立 Action", icon="LOCKED")
 
         finish = layout.box()
-        finish.label(text="5. 结果与恢复", icon="RECOVER_LAST")
+        finish.label(text="5. 输出结果", icon="RECOVER_LAST")
         if settings.last_output_action:
             row = finish.row(align=True)
             row.label(text=f"上次输出：{settings.last_output_action}", icon="ACTION")
@@ -187,16 +179,16 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
         recovery_pending = bool(
             settings.constraint_snapshot_json
             or settings.previous_target_state_available
-            or settings.previous_blendcap_mapping_json
         )
         if recovery_pending:
-            finish.operator("ba_motion_bridge.restore_previous_state", text="恢复角色原状态", icon="LOOP_BACK")
+            finish.operator(
+                "ba_motion_bridge.restore_previous_state",
+                text="撤销本次应用（保留输出 Action）",
+                icon="LOOP_BACK",
+            )
         else:
             finish.label(text="当前没有待恢复事务", icon="CHECKMARK")
-        row = finish.row(align=True)
-        if settings.previous_blendcap_mapping_json:
-            row.operator("ba_motion_bridge.restore_previous_mapping", text="仅恢复映射", icon="LOOP_BACK")
-        row.operator("ba_motion_bridge.cleanup_temporary", text="清理临时资源", icon="TRASH")
+        finish.operator("ba_motion_bridge.cleanup_temporary", text="清理临时资源", icon="TRASH")
 
 
 CLASSES = (BAM_PT_proscenium_motion_bridge,)
