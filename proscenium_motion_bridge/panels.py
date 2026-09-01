@@ -1,4 +1,5 @@
 import bpy
+import textwrap
 
 from .operators import (
     _animation_present,
@@ -14,10 +15,25 @@ def _live_armature(obj) -> bool:
         return False
 
 
-def _draw_status(layout, settings) -> None:
+def _text_width(context, *, inset: int = 0) -> int:
+    region_width = int(getattr(getattr(context, "region", None), "width", 280) or 280)
+    return max(14, min(54, int((region_width - 28 - inset) / 11)))
+
+
+def _draw_wrapped(layout, context, text: str, *, icon: str = "NONE", inset: int = 0) -> None:
+    lines = textwrap.wrap(
+        str(text or ""),
+        width=_text_width(context, inset=inset),
+        break_long_words=True,
+        break_on_hyphens=False,
+    ) or [""]
+    for index, line in enumerate(lines):
+        layout.label(text=line, icon=icon if index == 0 else "BLANK1")
+
+
+def _draw_status(layout, settings, context) -> None:
     if settings.expected_count:
-        row = layout.row(align=True)
-        row.label(
+        layout.label(
             text=f"主链 {settings.matched_count}/{settings.expected_count}",
             icon="CHECKMARK" if settings.mapping_valid else "ERROR",
         )
@@ -26,15 +42,15 @@ def _draw_status(layout, settings) -> None:
             "MMD": "MMD FK 骨架",
         }.get(settings.target_profile, settings.target_profile)
         if profile:
-            row.label(text=profile, icon="ARMATURE_DATA")
+            layout.label(text=profile, icon="ARMATURE_DATA")
         if settings.auto_scale:
-            row.label(text=f"比例 {settings.scale_ratio:.4f}×")
+            layout.label(text=f"位移比例 {settings.scale_ratio:.4f}×", icon="EMPTY_ARROWS")
 
-    row = layout.row()
     level = getattr(settings, "status_level", "INFO")
-    row.alert = level == "ERROR"
+    status = layout.column(align=True)
+    status.alert = level == "ERROR"
     icon = {"READY": "CHECKMARK", "WARNING": "ERROR", "ERROR": "ERROR"}.get(level, "INFO")
-    row.label(text=settings.status_message, icon=icon)
+    _draw_wrapped(status, context, settings.status_message, icon=icon, inset=12)
 
     if settings.critical_missing:
         warning = layout.column(align=True)
@@ -43,7 +59,7 @@ def _draw_status(layout, settings) -> None:
         for item in settings.critical_missing.split("、")[:8]:
             warning.label(text=f"• {item}")
     if settings.next_action and level != "READY":
-        layout.label(text=f"下一步：{settings.next_action}", icon="FORWARD")
+        _draw_wrapped(layout, context, f"下一步：{settings.next_action}", icon="FORWARD")
 
 
 class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
@@ -60,18 +76,28 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
         generating = bool(proscenium and getattr(proscenium, "is_generating", False))
         previewing = bool(proscenium and getattr(proscenium, "is_previewing", False))
 
+        if settings.progress_active:
+            progress_box = layout.box()
+            progress_box.label(text="正在处理，请勿重复点击", icon="SORTTIME")
+            progress_box.progress(
+                factor=settings.progress_value,
+                type="BAR",
+                text=settings.progress_message or "正在处理…",
+            )
+
         rigs = layout.box()
         rigs.label(text="1. 选择骨架", icon="ARMATURE_DATA")
-        rigs.prop(settings, "source_rig")
-        rigs.prop(settings, "target_rig")
+        rigs.label(text="Proscenium 官方源")
+        rigs.prop(settings, "source_rig", text="")
+        rigs.label(text="角色目标骨架")
+        rigs.prop(settings, "target_rig", text="")
         source_ready = _is_official_source(settings.source_rig)
         target_ready = _live_armature(settings.target_rig) and settings.target_rig != settings.source_rig
-        states = rigs.row(align=True)
-        states.label(
+        rigs.label(
             text="官方源已识别" if source_ready else "等待官方源",
             icon="CHECKMARK" if source_ready else "INFO",
         )
-        states.label(
+        rigs.label(
             text="目标已选择" if target_ready else "等待角色目标",
             icon="CHECKMARK" if target_ready else "INFO",
         )
@@ -88,16 +114,20 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
         if target_conflict:
             conflict = rigs.box()
             conflict.alert = True
-            conflict.label(text=f"{previous_target.name} 仍有一个待处理恢复点", icon="ERROR")
-            conflict.label(text="“保留”会结束上一角色的一键恢复点", icon="INFO")
-            row = conflict.row(align=True)
-            restore = row.operator(
+            _draw_wrapped(
+                conflict,
+                context,
+                f"{previous_target.name} 仍有一个待处理恢复点",
+                icon="ERROR",
+            )
+            _draw_wrapped(conflict, context, "“保留”会结束上一角色的一键恢复点", icon="INFO")
+            restore = conflict.operator(
                 "ba_motion_bridge.resolve_target_switch",
                 text="恢复上一角色后切换",
                 icon="LOOP_BACK",
             )
             restore.mode = "RESTORE"
-            keep = row.operator(
+            keep = conflict.operator(
                 "ba_motion_bridge.resolve_target_switch",
                 text="保留上一角色输出",
                 icon="CHECKMARK",
@@ -106,7 +136,8 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
 
         options = layout.box()
         options.label(text="2. 输出设置", icon="SETTINGS")
-        options.prop(settings, "root_motion_policy")
+        options.label(text="根运动处理")
+        options.prop(settings, "root_motion_policy", text="")
         effective_root_motion = _effective_root_motion_mode(context.scene, settings)
         if settings.root_motion_policy == "AUTO":
             options.label(
@@ -114,36 +145,45 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
                 icon="INFO",
             )
         if effective_root_motion == "FULL":
-            row = options.row(align=True)
-            row.prop(settings, "auto_scale")
-            row.prop(settings, "world_location")
+            options.prop(settings, "auto_scale")
+            options.prop(settings, "world_location")
         options.prop(settings, "accept_preview_on_run")
 
         buffer = options.box()
         buffer.prop(settings, "use_start_buffer", icon="PREVIEW_RANGE")
         if settings.use_start_buffer:
-            buffer.prop(settings, "initial_pose_source")
+            buffer.label(text="初始姿态来源")
+            buffer.prop(settings, "initial_pose_source", text="")
             if settings.initial_pose_source == "ACTION_FRAME":
-                buffer.prop(settings, "initial_pose_action")
+                buffer.label(text="初始姿态 Action")
+                buffer.prop(settings, "initial_pose_action", text="")
                 buffer.prop(settings, "initial_pose_frame")
-            row = buffer.row(align=True)
-            row.prop(settings, "settle_frames")
-            row.prop(settings, "transition_frames")
+            buffer.prop(settings, "settle_frames")
+            buffer.prop(settings, "transition_frames")
             buffer.prop(settings, "evaluate_physics_preroll")
-            buffer.label(text="正式动作首帧不移动；缓冲保存在首帧之前", icon="INFO")
-            buffer.label(text="自动显示负帧预览范围，并停在缓冲起点", icon="TIME")
+            _draw_wrapped(buffer, context, "正式动作首帧不移动；缓冲保存在首帧之前", icon="INFO")
+            _draw_wrapped(buffer, context, "自动显示负帧预览范围，并停在缓冲起点", icon="TIME")
 
         mapping = layout.box()
         mapping.enabled = not target_conflict
         mapping.label(text="3. 识别与检查", icon="VIEWZOOM")
-        row = mapping.row(align=True)
-        row.operator("ba_motion_bridge.prepare_from_proscenium", text="自动识别并检查", icon="VIEWZOOM")
-        row.operator("ba_motion_bridge.validate_mapping", text="复查", icon="CHECKMARK")
-        _draw_status(mapping, settings)
+        mapping.operator(
+            "ba_motion_bridge.prepare_from_proscenium",
+            text="自动选择骨架、建立映射并检查",
+            icon="VIEWZOOM",
+        )
+        mapping.operator("ba_motion_bridge.validate_mapping", text="只复查当前映射", icon="CHECKMARK")
+        _draw_wrapped(
+            mapping,
+            context,
+            "自动检查会寻找可信目标；复查不会更换当前选择。",
+            icon="INFO",
+        )
+        _draw_status(mapping, settings, context)
         if settings.unmatched:
-            mapping.label(text=f"可选未匹配：{settings.unmatched}", icon="QUESTION")
+            _draw_wrapped(mapping, context, f"可选未匹配：{settings.unmatched}", icon="QUESTION")
         if settings.warnings:
-            mapping.label(text=settings.warnings, icon="INFO")
+            _draw_wrapped(mapping, context, settings.warnings, icon="INFO")
 
         output = layout.box()
         output.label(text="4. 输出动作", icon="ACTION")
@@ -160,6 +200,7 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
         motion_ready = source_ready and _animation_present(settings.source_rig)
         run.enabled = (
             not generating
+            and not settings.progress_active
             and not target_conflict
             and (previewing or motion_ready or settings.source_rig is None)
         )
@@ -168,14 +209,35 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
             text="接受并输出到角色" if previewing else "一键输出到角色",
             icon="ACTION",
         )
-        output.label(text="内置重定向 · 脚趾轴修正 · 起始缓冲 · 独立 Action", icon="LOCKED")
+        _draw_wrapped(
+            output,
+            context,
+            "Accept（若有预览）→ 检查映射 → 烘焙独立 Action → 写入负帧缓冲。",
+            icon="INFO",
+        )
+        _draw_wrapped(
+            output,
+            context,
+            "内置重定向 · 脚趾轴修正 · 失败自动回滚",
+            icon="LOCKED",
+        )
 
         finish = layout.box()
         finish.label(text="5. 输出结果", icon="RECOVER_LAST")
         if settings.last_output_action:
-            row = finish.row(align=True)
-            row.label(text=f"上次输出：{settings.last_output_action}", icon="ACTION")
-            row.operator("ba_motion_bridge.activate_output", text="激活", icon="RADIOBUT_ON")
+            output_action = bpy.data.actions.get(settings.last_output_action)
+            output_target = str(output_action.get("bam_target_object", "")) if output_action else ""
+            finish.label(text="上次输出 Action")
+            _draw_wrapped(finish, context, settings.last_output_action, icon="ACTION")
+            if output_target:
+                _draw_wrapped(finish, context, f"原目标：{output_target}", icon="ARMATURE_DATA")
+            activate = finish.operator(
+                "ba_motion_bridge.activate_output",
+                text="重新激活并预热物理",
+                icon="RADIOBUT_ON",
+            )
+            activate.action_name = settings.last_output_action
+            activate.target_name = output_target
         recovery_pending = bool(
             settings.constraint_snapshot_json
             or settings.previous_target_state_available
@@ -186,9 +248,21 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
                 text="撤销本次应用（保留输出 Action）",
                 icon="LOOP_BACK",
             )
+            _draw_wrapped(
+                finish,
+                context,
+                "恢复原 Action、约束、IK/FK 和时间轴；输出 Action 不会被删除。",
+                icon="INFO",
+            )
         else:
             finish.label(text="当前没有待恢复事务", icon="CHECKMARK")
         finish.operator("ba_motion_bridge.cleanup_temporary", text="清理临时资源", icon="TRASH")
+        _draw_wrapped(
+            finish,
+            context,
+            "只清理插件标记的未使用临时数据，不删除输出 Action。",
+            icon="INFO",
+        )
 
 
 CLASSES = (BAM_PT_proscenium_motion_bridge,)

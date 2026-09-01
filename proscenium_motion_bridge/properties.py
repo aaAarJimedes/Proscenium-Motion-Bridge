@@ -153,6 +153,15 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
         options={"HIDDEN"},
     )
     last_output_action: StringProperty(default="", options={"HIDDEN"})
+    progress_active: BoolProperty(default=False, options={"HIDDEN", "SKIP_SAVE"})
+    progress_value: FloatProperty(
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+    progress_message: StringProperty(default="", options={"HIDDEN", "SKIP_SAVE"})
     previous_target_state_available: BoolProperty(default=False, options={"HIDDEN"})
     previous_target_rig: PointerProperty(
         type=bpy.types.Object,

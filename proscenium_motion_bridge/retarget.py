@@ -92,6 +92,7 @@ def bake_retarget(
     source_rest_override: dict[str, Matrix] | None,
     location_scale: float,
     world_location: bool,
+    progress=None,
 ) -> BakeResult:
     """Bake Proscenium motion without reading or mutating another add-on.
 
@@ -143,6 +144,8 @@ def bake_retarget(
         obj.hide_set(False)
 
     try:
+        if progress is not None:
+            progress(0.0, "初始化目标骨架")
         # The uncaptured first pass settles driven/MCH parent chains. Only the
         # second pass at frame_start writes keys.
         passes = [(frame_start, False)] + [
@@ -151,6 +154,12 @@ def bake_retarget(
         for frame, capture in passes:
             scene.frame_set(frame)
             bpy.context.view_layer.update()
+            if capture and progress is not None:
+                frame_count = max(1, frame_end - frame_start + 1)
+                progress(
+                    (frame - frame_start + 1) / frame_count,
+                    f"烘焙动作帧 {frame}/{frame_end}",
+                )
             previous_depth = None
 
             for target_name in target_names:

@@ -4,9 +4,10 @@ import hashlib
 import json
 import re
 import statistics
+import time
 
 import bpy
-from bpy.props import EnumProperty
+from bpy.props import EnumProperty, StringProperty
 from mathutils import Matrix, Quaternion
 
 from .constants import (
@@ -19,6 +20,82 @@ from .constants import (
 )
 from .mapping import MappingResult, build_mapping, is_official_canonical_bones, normalize
 from .retarget import bake_retarget
+
+
+class _OperationProgress:
+    """Mirror long synchronous work to Blender's status bar and this panel."""
+
+    def __init__(self, context, settings, title: str):
+        self.context = context
+        self.settings = settings
+        self.title = title
+        self.window_manager = context.window_manager
+        self.window = getattr(context, "window", None)
+        self.started = False
+        self.last_draw = 0.0
+
+    def begin(self, message: str) -> None:
+        self.started = True
+        self.settings.progress_active = True
+        self.settings.progress_value = 0.0
+        self.settings.progress_message = message
+        self.window_manager.progress_begin(0, 1000)
+        if self.window is not None:
+            try:
+                self.window.cursor_modal_set("WAIT")
+            except (AttributeError, RuntimeError):
+                pass
+        self._redraw(force=True)
+
+    def update(self, factor: float, message: str = "") -> None:
+        if not self.started:
+            return
+        factor = max(0.0, min(1.0, float(factor)))
+        self.settings.progress_value = factor
+        if message:
+            self.settings.progress_message = message
+        self.window_manager.progress_update(round(factor * 1000))
+        now = time.monotonic()
+        self._redraw(force=factor >= 1.0 or now - self.last_draw >= 0.08)
+
+    def stage(self, start: float, end: float, prefix: str = ""):
+        span = max(0.0, float(end) - float(start))
+
+        def callback(factor: float, message: str = "") -> None:
+            label = f"{prefix}：{message}" if prefix and message else (message or prefix)
+            self.update(float(start) + span * max(0.0, min(1.0, float(factor))), label)
+
+        return callback
+
+    def end(self) -> None:
+        if not self.started:
+            return
+        try:
+            self.window_manager.progress_end()
+        finally:
+            if self.window is not None:
+                try:
+                    self.window.cursor_modal_restore()
+                except (AttributeError, RuntimeError):
+                    pass
+            self.settings.progress_active = False
+            self.settings.progress_value = 0.0
+            self.settings.progress_message = ""
+            self.started = False
+            self._redraw(force=True)
+
+    def _redraw(self, *, force: bool = False) -> None:
+        for window in getattr(self.window_manager, "windows", ()):
+            screen = getattr(window, "screen", None)
+            for area in getattr(screen, "areas", ()) if screen is not None else ():
+                if area.type in {"VIEW_3D", "STATUSBAR"}:
+                    area.tag_redraw()
+        if force and self.window is not None:
+            self.last_draw = time.monotonic()
+            try:
+                bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
+            except (AttributeError, RuntimeError):
+                pass
 
 
 def operator_available(path: str) -> bool:
@@ -844,6 +921,7 @@ def _insert_start_buffer(
     initial_pose: dict[str, Matrix],
     settle_frames: int,
     transition_frames: int,
+    progress=None,
 ) -> dict:
     """Add hidden pre-roll keys while preserving the formal motion range."""
     settle_frames = max(0, int(settle_frames))
@@ -871,6 +949,8 @@ def _insert_start_buffer(
 
     preroll_start = motion_start - total_frames
     transition_start = motion_start - transition_frames
+    if progress is not None:
+        progress(0.0, "准备首帧缓冲")
     for frame in range(preroll_start, motion_start):
         factor = 0.0
         if transition_frames > 0 and frame >= transition_start:
@@ -886,6 +966,11 @@ def _insert_start_buffer(
                 pose_bone.keyframe_insert(_rotation_property(pose_bone), frame=frame, group=bone_name)
             if bone_name in location_targets:
                 pose_bone.keyframe_insert("location", frame=frame, group=bone_name)
+        if progress is not None:
+            progress(
+                (frame - preroll_start + 1) / max(1, total_frames),
+                f"写入缓冲帧 {frame}/{motion_start - 1}",
+            )
 
     for fcurve in _iter_action_fcurves(action):
         for point in fcurve.keyframe_points:
@@ -1009,20 +1094,35 @@ def _restore_saved_physics_cache(scene, settings) -> str:
     return "SKIPPED"
 
 
-def _evaluate_physics_preroll(scene, preroll_start: int, motion_start: int) -> dict:
+def _evaluate_physics_preroll(
+    scene,
+    preroll_start: int,
+    motion_start: int,
+    progress=None,
+) -> dict:
     timeline_result = _extend_preroll_timeline(scene, preroll_start)
     rigidbody_world = getattr(scene, "rigidbody_world", None)
     point_cache = getattr(rigidbody_world, "point_cache", None)
     if point_cache is None:
+        if progress is not None:
+            progress(1.0, "未检测到刚体世界，已跳过物理预热")
         return {"status": "NO_RIGID_BODY_WORLD", "evaluated_frames": 0}
     if bool(getattr(point_cache, "is_baked", False)):
+        if progress is not None:
+            progress(1.0, "检测到已烘焙缓存，未覆盖")
         return {"status": "BAKED_CACHE", "evaluated_frames": 0}
 
     evaluated = 0
+    total_frames = max(1, int(motion_start) - int(preroll_start) + 1)
     for frame in range(int(preroll_start), int(motion_start) + 1):
         scene.frame_set(frame)
         bpy.context.view_layer.update()
         evaluated += 1
+        if progress is not None:
+            progress(
+                evaluated / total_frames,
+                f"预热物理帧 {frame}/{motion_start}",
+            )
     scene.frame_set(preroll_start)
     bpy.context.view_layer.update()
     return {
@@ -1038,7 +1138,7 @@ def _evaluate_physics_preroll(scene, preroll_start: int, motion_start: int) -> d
             pass
 
 
-def _sample_nla_to_temporary_action(scene, source, state: dict):
+def _sample_nla_to_temporary_action(scene, source, state: dict, progress=None):
     animation_data = source.animation_data
     strips = _effective_nla_strips(animation_data)
     frame_start = max(scene.frame_start, int(min(strip.frame_start for strip in strips)))
@@ -1048,10 +1148,16 @@ def _sample_nla_to_temporary_action(scene, source, state: dict):
 
     pose_bones = [source.pose.bones[bone.name] for bone in source.data.bones]
     samples: dict[int, dict[str, object]] = {}
+    frame_count = max(1, frame_end - frame_start + 1)
     for frame in range(frame_start, frame_end + 1):
         scene.frame_set(frame)
         bpy.context.view_layer.update()
         samples[frame] = {pose_bone.name: pose_bone.matrix_basis.copy() for pose_bone in pose_bones}
+        if progress is not None:
+            progress(
+                0.5 * (frame - frame_start + 1) / frame_count,
+                f"采样 NLA 帧 {frame}/{frame_end}",
+            )
 
     before_actions = {action.as_pointer() for action in bpy.data.actions}
     try:
@@ -1068,6 +1174,11 @@ def _sample_nla_to_temporary_action(scene, source, state: dict):
                 pose_bone.keyframe_insert("rotation_quaternion", frame=frame)
                 if pose_bone.name == "Hips":
                     pose_bone.keyframe_insert("location", frame=frame)
+            if progress is not None:
+                progress(
+                    0.5 + 0.5 * (frame - frame_start + 1) / frame_count,
+                    f"转换 NLA 帧 {frame}/{frame_end}",
+                )
 
         temporary = animation_data.action
         if temporary is None:
@@ -1094,7 +1205,7 @@ def _sample_nla_to_temporary_action(scene, source, state: dict):
         raise
 
 
-def _prepare_source_action(scene, source, *, evaluate_nla: bool = False) -> dict:
+def _prepare_source_action(scene, source, *, evaluate_nla: bool = False, progress=None) -> dict:
     animation_data = source.animation_data
     state = {
         "previous_action": animation_data.action,
@@ -1113,6 +1224,8 @@ def _prepare_source_action(scene, source, *, evaluate_nla: bool = False) -> dict
         if animation_data.use_nla:
             animation_data.use_nla = False
             state["changed"] = True
+        if progress is not None:
+            progress(1.0, "活动 Action 已就绪")
         return state
 
     strips = _effective_nla_strips(animation_data)
@@ -1141,10 +1254,12 @@ def _prepare_source_action(scene, source, *, evaluate_nla: bool = False) -> dict
         animation_data.use_nla = False
         _bind_action(animation_data, strip.action)
         state["label"] = strip.action.name
+        if progress is not None:
+            progress(1.0, "已直接读取接受后的 NLA Action")
         return state
 
     try:
-        _sample_nla_to_temporary_action(scene, source, state)
+        _sample_nla_to_temporary_action(scene, source, state, progress=progress)
         return state
     except Exception:
         _restore_source_action(scene, source, state)
@@ -1180,7 +1295,10 @@ def _restore_source_action(scene, source, state: dict) -> None:
 class BAM_OT_auto_map(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.auto_map"
     bl_label = "自动映射官方骨架 → 角色"
-    bl_description = "识别官方 SOMA 骨架与 MMD/Auto-Rig Pro 目标主链；映射完全由本插件管理"
+    bl_description = (
+        "检查 kimodo-soma-rp 官方骨架签名，识别 MMD 或 Auto-Rig Pro 主控制链，"
+        "计算位移比例并建立仅由本插件管理的内部映射表"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1199,7 +1317,10 @@ class BAM_OT_auto_map(bpy.types.Operator):
 class BAM_OT_prepare_from_proscenium(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.prepare_from_proscenium"
     bl_label = "自动准备角色输出"
-    bl_description = "读取 Proscenium 官方骨架、自动寻找最佳 MMD/Auto-Rig Pro 目标并完成高置信度映射检查"
+    bl_description = (
+        "优先读取 Proscenium 当前官方骨架；在未手动指定时自动选择最可信的 MMD/Auto-Rig Pro 目标，"
+        "然后检查骨架签名、完整主链、重复目标、对象缩放和位移比例"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1226,7 +1347,10 @@ class BAM_OT_prepare_from_proscenium(bpy.types.Operator):
 class BAM_OT_validate_mapping(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.validate_mapping"
     bl_label = "检查映射"
-    bl_description = "重新检查官方骨架签名、目标配置、主链覆盖率、层级和对象缩放"
+    bl_description = (
+        "不更换当前源和目标，只重新验证官方骨架签名、目标类型、主链覆盖率、"
+        "重复通道、骨架层级和非等比对象缩放"
+    )
     bl_options = {"REGISTER"}
 
     def execute(self, context):
@@ -1243,8 +1367,8 @@ class BAM_OT_retarget(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.retarget"
     bl_label = "一键重定向到角色"
     bl_description = (
-        "使用插件自有世界空间 rest-pose 烘焙器；先新建独立 Action，"
-        "再以可精确恢复的窄范围 FK-safe 事务保护 MMD 腿链"
+        "使用插件自有的世界空间 Rest Pose 求解器逐帧烘焙；生成独立 Action、"
+        "修正 ToeBase/つま先轴差异、写入可选负帧缓冲，并保存可精确恢复的目标状态"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -1292,13 +1416,17 @@ class BAM_OT_retarget(bpy.types.Operator):
         new_snapshot_written = False
         error_message = ""
         success = False
+        operation_progress = _OperationProgress(context, settings, "输出角色动作")
+        operation_progress.begin("准备源动作")
         try:
             source_state = _prepare_source_action(
                 scene,
                 source,
                 evaluate_nla=False,
+                progress=operation_progress.stage(0.02, 0.14, "准备源动作"),
             )
             source_motion = source_state["label"]
+            operation_progress.update(0.16, "保存目标状态并切换 FK")
 
             animation_data = target.animation_data_create()
             previous_action = animation_data.action
@@ -1332,8 +1460,10 @@ class BAM_OT_retarget(bpy.types.Operator):
                 source_rest_override=source_rest_override,
                 location_scale=settings.scale_ratio if settings.auto_scale else 1.0,
                 world_location=bool(settings.world_location),
+                progress=operation_progress.stage(0.18, 0.76, "重定向"),
             )
             created_action = bake_result.action
+            operation_progress.update(0.78, "整理输出 Action")
 
             created_action.name = f"ACT_{_safe_action_name(target.name)}_{_safe_action_name(source_motion)}_MMD"
             created_action.use_fake_user = True
@@ -1358,6 +1488,7 @@ class BAM_OT_retarget(bpy.types.Operator):
                     initial_pose,
                     settings.settle_frames,
                     settings.transition_frames,
+                    progress=operation_progress.stage(0.79, 0.90, "起始缓冲"),
                 )
                 created_action["bam_motion_frame_start"] = buffer_result["motion_start"]
                 created_action["bam_motion_frame_end"] = buffer_result["motion_end"]
@@ -1370,13 +1501,17 @@ class BAM_OT_retarget(bpy.types.Operator):
                         scene,
                         buffer_result["preroll_start"],
                         buffer_result["motion_start"],
+                        progress=operation_progress.stage(0.91, 0.98, "物理预热"),
                     )
                 else:
                     _extend_preroll_timeline(scene, buffer_result["preroll_start"])
                 created_action["bam_physics_preroll_status"] = physics_result["status"]
                 created_action["bam_physics_preroll_frames"] = int(physics_result["evaluated_frames"])
                 created_action["bam_timeline_frame_start"] = int(buffer_result["preroll_start"])
+            else:
+                operation_progress.update(0.98, "跳过起始缓冲")
 
+            operation_progress.update(0.99, "保存恢复点与输出信息")
             settings.constraint_snapshot_json = (
                 json.dumps(constraint_rows, ensure_ascii=False) if constraint_rows else ""
             )
@@ -1462,6 +1597,7 @@ class BAM_OT_retarget(bpy.types.Operator):
         finally:
             if source_state is not None:
                 _restore_source_action(scene, source, source_state)
+            operation_progress.end()
 
         if not success:
             _set_failure(
@@ -1489,8 +1625,8 @@ class BAM_OT_accept_and_retarget(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.accept_and_retarget"
     bl_label = "接受并一键输出到角色"
     bl_description = (
-        "若 Proscenium 正在预览则先接受动作，再自动识别官方骨架和角色目标、"
-        "检查映射并生成独立角色 Action"
+        "若 Proscenium 正在预览则先 Accept；随后自动识别骨架、验证完整主链、"
+        "用内置引擎生成独立 Action，并按设置写入负帧起始缓冲；进度显示在状态栏和本面板"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -1541,8 +1677,29 @@ class BAM_OT_accept_and_retarget(bpy.types.Operator):
 class BAM_OT_activate_output(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.activate_output"
     bl_label = "激活上次角色输出"
-    bl_description = "把上次桥接生成的独立 Action 重新设为目标骨架的活动动作"
+    bl_description = (
+        "把上次生成的独立 Action 重新绑定到当前目标，切换必要的 FK 状态，"
+        "并从负帧缓冲起点逐帧预热未烘焙物理"
+    )
     bl_options = {"REGISTER", "UNDO"}
+
+    action_name: StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+    target_name: StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+
+    @classmethod
+    def description(cls, _context, properties):
+        name = getattr(properties, "action_name", "")
+        target_name = getattr(properties, "target_name", "")
+        details = []
+        if name:
+            details.append(f"Action：{name}")
+        if target_name:
+            details.append(f"原目标：{target_name}")
+        suffix = "\n" + "\n".join(details) if details else ""
+        return (
+            "重新绑定上次输出 Action，恢复输出所需的 FK 状态；若存在负帧缓冲，"
+            "会逐帧预热未烘焙物理，且不会删除当前或旧 Action" + suffix
+        )
 
     @classmethod
     def poll(cls, context):
@@ -1552,27 +1709,43 @@ class BAM_OT_activate_output(bpy.types.Operator):
     def execute(self, context):
         settings = context.scene.ba_motion_bridge_settings
         action = bpy.data.actions.get(settings.last_output_action)
+        recorded_target_name = str(action.get("bam_target_object", "")) if action is not None else ""
         try:
-            target = settings.target_rig
+            configured_target = settings.target_rig
         except ReferenceError:
-            target = None
+            configured_target = None
+        target = bpy.data.objects.get(recorded_target_name) if recorded_target_name else configured_target
+        if recorded_target_name and target is None:
+            self.report({"ERROR"}, f"输出 Action 记录的原目标 {recorded_target_name} 已不存在")
+            return {"CANCELLED"}
         if action is None or not _is_armature(target):
             self.report({"ERROR"}, "上次输出 Action 或目标骨架已不存在")
             return {"CANCELLED"}
         animation_data = target.animation_data_create()
+        operation_progress = _OperationProgress(context, settings, "重新激活输出")
+        operation_progress.begin("绑定输出 Action")
         try:
             _bind_action(animation_data, action)
             animation_data.use_nla = False
             _force_target_fk_switches(target)
+            operation_progress.update(0.12, "已绑定 Action，准备时间轴")
             motion_start = int(action.get("bam_motion_frame_start", context.scene.frame_start))
             preroll_start = int(action.get("bam_preroll_frame_start", motion_start))
             if preroll_start < motion_start:
-                _evaluate_physics_preroll(context.scene, preroll_start, motion_start)
+                _evaluate_physics_preroll(
+                    context.scene,
+                    preroll_start,
+                    motion_start,
+                    progress=operation_progress.stage(0.15, 0.96, "重新预热"),
+                )
             else:
                 context.scene.frame_set(motion_start)
+                operation_progress.update(0.96, "动作没有负帧缓冲，已定位首帧")
         except (AttributeError, RuntimeError, TypeError) as exc:
             self.report({"ERROR"}, f"激活输出失败：{exc}")
             return {"CANCELLED"}
+        finally:
+            operation_progress.end()
         _activate_target(context, target)
         settings.status_message = f"已激活输出：{action.name}"
         self.report({"INFO"}, settings.status_message)
@@ -1582,7 +1755,10 @@ class BAM_OT_activate_output(bpy.types.Operator):
 class BAM_OT_restore_constraints(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.restore_constraints"
     bl_label = "精确恢复腿链约束"
-    bl_description = "按重定向前记录的 owner/name/mute/influence 精确恢复约束，不强制改成默认值"
+    bl_description = (
+        "按重定向前记录的骨骼、约束名称、mute 和 influence 精确恢复腿链/腰取消约束；"
+        "不会重置未参与映射的手臂、裙发、附件或物理约束"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -1604,7 +1780,10 @@ class BAM_OT_restore_constraints(bpy.types.Operator):
 class BAM_OT_restore_previous_target_animation(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.restore_previous_target_animation"
     bl_label = "切回之前的目标动画"
-    bl_description = "恢复重定向前的目标 Action、Action Slot 和 NLA 开关；新输出 Action 会继续保留"
+    bl_description = (
+        "把目标切回重定向前的 Action、Action Slot、NLA 与 IK/FK 状态，同时恢复时间轴和物理缓存起点；"
+        "新输出 Action 仍作为数据块保留"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -1670,7 +1849,10 @@ class BAM_OT_restore_previous_target_animation(bpy.types.Operator):
 class BAM_OT_restore_previous_state(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.restore_previous_state"
     bl_label = "恢复角色原状态"
-    bl_description = "依次恢复桥接前的腿链约束、目标 Action/NLA、时间轴和物理缓存；输出 Action 保留"
+    bl_description = (
+        "一次撤销本次桥接对角色状态的应用：恢复腿链约束、IK/FK、原 Action/NLA、"
+        "时间轴和物理缓存起点；不会删除已生成的输出 Action"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -1717,7 +1899,10 @@ class BAM_OT_restore_previous_state(bpy.types.Operator):
 class BAM_OT_resolve_target_switch(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.resolve_target_switch"
     bl_label = "处理上一角色恢复点"
-    bl_description = "在切换目标角色前，明确决定恢复上一角色，或保留其当前桥接输出并结束恢复点"
+    bl_description = (
+        "切换目标角色前处理上一角色的恢复点：可先恢复上一角色的动画/约束/时间轴，"
+        "也可明确保留当前输出并放弃该恢复点"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     mode: EnumProperty(
@@ -1786,7 +1971,10 @@ class BAM_OT_resolve_target_switch(bpy.types.Operator):
 class BAM_OT_cleanup_temporary(bpy.types.Operator):
     bl_idname = "ba_motion_bridge.cleanup_temporary"
     bl_label = "清理桥接临时资源"
-    bl_description = "只移除本插件标记且未被使用的临时 Action/对象；不会删除重定向结果"
+    bl_description = (
+        "只删除带 Proscenium Motion Bridge 所有权与 temporary 标记的未使用临时 Action/对象；"
+        "不会删除输出 Action、用户动作、模型、贴图、预设或工程文件"
+    )
     bl_options = {"REGISTER"}
 
     def execute(self, _context):
