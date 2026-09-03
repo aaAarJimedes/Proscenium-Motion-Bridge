@@ -153,6 +153,9 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
             _draw_wrapped(options, context, "保留角色布置；动作前方跟随角色初始朝向", icon="ORIENTATION_GLOBAL")
         else:
             _draw_wrapped(options, context, "兼容旧行为：动作方向保持官方骨架世界坐标", icon="INFO")
+        options.prop(settings, "use_end_effector_guard", icon="CON_KINEMATIC")
+        if settings.use_end_effector_guard:
+            _draw_wrapped(options, context, "近距离时按角色比例稳定双腕，减少手掌与前臂互穿", icon="INFO")
         options.prop(settings, "accept_preview_on_run")
 
         buffer = options.box()

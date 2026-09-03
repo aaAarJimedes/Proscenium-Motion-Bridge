@@ -15,6 +15,8 @@ class BakeResult:
     frame_start: int
     frame_end: int
     keyed_channels: int
+    guarded_frames: int = 0
+    max_guard_correction: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,18 @@ class PlacementContext:
     baseline_locations: dict[str, Vector]
     placement_bone: str
     alignment_yaw_degrees: float
+
+
+@dataclass(frozen=True)
+class _ArmGuardChain:
+    source_upper: str
+    source_forearm: str
+    source_hand: str
+    target_upper: str
+    target_forearm: str
+    target_hand: str
+    scale_ratio: float
+    target_extent_world: float
 
 
 _TARGET_PLACEMENT = "TARGET_PLACEMENT"
@@ -238,6 +252,232 @@ def _rest_invariants(source, target, pair, source_rest_override, placement):
     }
 
 
+def _rest_bone_world_length(rig, bone_name: str) -> float:
+    bone = rig.data.bones[bone_name]
+    head = rig.matrix_world @ bone.head_local
+    tail = rig.matrix_world @ bone.tail_local
+    return (tail - head).length
+
+
+def _rest_head_world(rig, bone_name: str) -> Vector:
+    return rig.matrix_world @ rig.data.bones[bone_name].head_local
+
+
+def _is_descendant_bone(child, ancestor) -> bool:
+    current = child.parent
+    while current is not None:
+        if current == ancestor:
+            return True
+        current = current.parent
+    return False
+
+
+def _rest_chain_world_length(rig, upper_name: str, forearm_name: str, hand_name: str) -> float:
+    shoulder = _rest_head_world(rig, upper_name)
+    elbow = _rest_head_world(rig, forearm_name)
+    wrist = _rest_head_world(rig, hand_name)
+    return (elbow - shoulder).length + (wrist - elbow).length
+
+
+def _build_arm_guard_context(source, target, result: MappingResult):
+    """Describe two hierarchical FK arms without assuming bone names.
+
+    The source and target roles come from the add-on's own mapping. Descendant
+    checks allow ordinary arm/wrist twist helpers while keeping the solver away
+    from controls that do not form an actual FK chain.
+    """
+    by_role = {pair.role: pair for pair in result.pairs}
+    chains: list[_ArmGuardChain] = []
+    for side in ("left", "right"):
+        roles = [f"{side}_upper_arm", f"{side}_forearm", f"{side}_hand"]
+        if any(role not in by_role for role in roles):
+            return None
+        upper_pair, forearm_pair, hand_pair = (by_role[role] for role in roles)
+        source_names = (upper_pair.source, forearm_pair.source, hand_pair.source)
+        target_names = (upper_pair.target, forearm_pair.target, hand_pair.target)
+        if any(name not in source.pose.bones for name in source_names):
+            return None
+        if any(name not in target.pose.bones for name in target_names):
+            return None
+        target_upper = target.data.bones[target_names[0]]
+        target_forearm = target.data.bones[target_names[1]]
+        target_hand = target.data.bones[target_names[2]]
+        if not _is_descendant_bone(target_forearm, target_upper):
+            return None
+        if not _is_descendant_bone(target_hand, target_forearm):
+            return None
+
+        source_chain = _rest_chain_world_length(source, *source_names)
+        target_chain = _rest_chain_world_length(target, *target_names)
+        if source_chain <= 1e-8 or target_chain <= 1e-8:
+            return None
+        hand_length = _rest_bone_world_length(target, target_names[2])
+        chains.append(
+            _ArmGuardChain(
+                source_upper=source_names[0],
+                source_forearm=source_names[1],
+                source_hand=source_names[2],
+                target_upper=target_names[0],
+                target_forearm=target_names[1],
+                target_hand=target_names[2],
+                scale_ratio=target_chain / source_chain,
+                target_extent_world=max(hand_length, target_chain * 0.12),
+            )
+        )
+
+    source_width = (
+        _rest_head_world(source, chains[0].source_upper)
+        - _rest_head_world(source, chains[1].source_upper)
+    ).length
+    target_width = (
+        _rest_head_world(target, chains[0].target_upper)
+        - _rest_head_world(target, chains[1].target_upper)
+    ).length
+    ratios = [chain.scale_ratio for chain in chains]
+    if source_width > 1e-8 and target_width > 1e-8:
+        ratios.append(target_width / source_width)
+    # Average shoulder and arm ratios. This is deliberately model-derived:
+    # no character-specific offsets or dimensions are embedded in the guard.
+    spatial_scale = sum(ratios) / len(ratios)
+    return tuple(chains), spatial_scale
+
+
+def _set_pose_matrix_rotation(pose_bone, rotation: Quaternion) -> None:
+    location, _old_rotation, scale = pose_bone.matrix.decompose()
+    pose_bone.matrix = Matrix.LocRotScale(location, rotation, scale)
+
+
+def _aim_pose_bone(pose_bone, endpoint: Vector) -> bool:
+    current = pose_bone.tail - pose_bone.head
+    desired = endpoint - pose_bone.head
+    if current.length_squared <= 1e-12 or desired.length_squared <= 1e-12:
+        return False
+    delta = current.rotation_difference(desired)
+    _set_pose_matrix_rotation(pose_bone, delta @ pose_bone.matrix.to_quaternion())
+    return True
+
+
+def _solve_two_bone_arm(target, chain: _ArmGuardChain, goal_world: Vector) -> tuple[str, ...]:
+    """Move one wrist to a reachable goal while preserving its palm rotation."""
+    upper = target.pose.bones[chain.target_upper]
+    forearm = target.pose.bones[chain.target_forearm]
+    hand = target.pose.bones[chain.target_hand]
+    goal = target.matrix_world.inverted() @ goal_world
+    snapshots = {
+        pose_bone.name: pose_bone.matrix_basis.copy()
+        for pose_bone in (upper, forearm, hand)
+    }
+
+    def restore() -> tuple[str, ...]:
+        for bone_name, matrix_basis in snapshots.items():
+            target.pose.bones[bone_name].matrix_basis = matrix_basis
+        bpy.context.view_layer.update()
+        return ()
+
+    shoulder = upper.head.copy()
+    elbow = forearm.head.copy()
+    wrist = hand.head.copy()
+    upper_length = (elbow - shoulder).length
+    forearm_length = (wrist - elbow).length
+    direction = goal - shoulder
+    distance = direction.length
+    if upper_length <= 1e-8 or forearm_length <= 1e-8 or distance <= 1e-8:
+        return restore()
+    direction.normalize()
+    minimum = abs(upper_length - forearm_length) + 1e-6
+    maximum = upper_length + forearm_length - 1e-6
+    reach = max(minimum, min(maximum, distance))
+    reachable_goal = shoulder + direction * reach
+
+    pole = (elbow - shoulder) - direction * (elbow - shoulder).dot(direction)
+    if pole.length_squared <= 1e-10:
+        pole = (upper.matrix.to_3x3() @ Vector((1.0, 0.0, 0.0)))
+        pole -= direction * pole.dot(direction)
+    if pole.length_squared <= 1e-10:
+        fallback = Vector((0.0, 0.0, 1.0))
+        if abs(direction.dot(fallback)) > 0.95:
+            fallback = Vector((1.0, 0.0, 0.0))
+        pole = fallback - direction * fallback.dot(direction)
+    pole.normalize()
+
+    along = (
+        upper_length * upper_length
+        - forearm_length * forearm_length
+        + reach * reach
+    ) / (2.0 * reach)
+    height_squared = max(0.0, upper_length * upper_length - along * along)
+    target_elbow = shoulder + direction * along + pole * math.sqrt(height_squared)
+    hand_rotation = hand.matrix.to_quaternion().copy()
+
+    if not _aim_pose_bone(upper, target_elbow):
+        return restore()
+    bpy.context.view_layer.update()
+    if not _aim_pose_bone(forearm, reachable_goal):
+        return restore()
+    bpy.context.view_layer.update()
+    _set_pose_matrix_rotation(hand, hand_rotation)
+    bpy.context.view_layer.update()
+    initial_error = (wrist - reachable_goal).length
+    achieved_error = (hand.head - reachable_goal).length
+    if achieved_error >= initial_error - 1e-7:
+        return restore()
+    return chain.target_upper, chain.target_forearm, chain.target_hand
+
+
+def _apply_end_effector_guard(source, target, guard_context, alignment: Quaternion):
+    """Correct only extra near-contact convergence introduced by proportions."""
+    if guard_context is None:
+        return (), 0.0
+    chains, spatial_scale = guard_context
+    source_shoulders = [
+        source.matrix_world @ source.pose.bones[chain.source_upper].head
+        for chain in chains
+    ]
+    target_shoulders = [
+        target.matrix_world @ target.pose.bones[chain.target_upper].head
+        for chain in chains
+    ]
+    source_center = (source_shoulders[0] + source_shoulders[1]) * 0.5
+    target_center = (target_shoulders[0] + target_shoulders[1]) * 0.5
+    source_wrists = [
+        source.matrix_world @ source.pose.bones[chain.source_hand].head
+        for chain in chains
+    ]
+    target_wrists = [
+        target.matrix_world @ target.pose.bones[chain.target_hand].head
+        for chain in chains
+    ]
+    goals = [
+        target_center + alignment @ (wrist - source_center) * spatial_scale
+        for wrist in source_wrists
+    ]
+
+    current_separation = (target_wrists[0] - target_wrists[1]).length
+    goal_separation = (goals[0] - goals[1]).length
+    hand_extent = sum(chain.target_extent_world for chain in chains) * 0.5
+    if hand_extent <= 1e-8:
+        return (), 0.0
+    deficit = goal_separation - current_separation
+    proximity_limit = hand_extent * 2.25
+    if deficit <= hand_extent * 0.01 or current_separation >= proximity_limit:
+        return (), 0.0
+
+    convergence = min(1.0, deficit / max(hand_extent * 0.5, 1e-8))
+    proximity = min(1.0, max(0.0, (proximity_limit - current_separation) / hand_extent))
+    strength = min(convergence, proximity)
+    strength = strength * strength * (3.0 - 2.0 * strength)
+    if strength <= 1e-4:
+        return (), 0.0
+
+    corrected: list[str] = []
+    max_correction = 0.0
+    for chain, current, goal in zip(chains, target_wrists, goals):
+        blended_goal = current.lerp(goal, strength)
+        max_correction = max(max_correction, (blended_goal - current).length)
+        corrected.extend(_solve_two_bone_arm(target, chain, blended_goal))
+    return tuple(dict.fromkeys(corrected)), max_correction
+
+
 def bake_retarget(
     scene,
     source,
@@ -249,6 +489,7 @@ def bake_retarget(
     world_location: bool,
     motion_space: str = _TARGET_PLACEMENT,
     placement: PlacementContext | None = None,
+    end_effector_guard: bool = True,
     progress=None,
 ) -> BakeResult:
     """Bake Proscenium motion without reading or mutating another add-on.
@@ -275,6 +516,11 @@ def bake_retarget(
     use_target_placement = placement.motion_space == _TARGET_PLACEMENT
     alignment_q = placement.alignment_rotation
     alignment_q_inverse = alignment_q.inverted()
+    arm_guard_context = (
+        _build_arm_guard_context(source, target, result)
+        if end_effector_guard
+        else None
+    )
 
     by_target: dict[str, list[dict]] = {}
     for pair in valid_pairs:
@@ -303,6 +549,8 @@ def bake_retarget(
     target_world_rotation_inverse = target.matrix_world.to_quaternion().inverted()
     last_quaternion: dict[str, Quaternion] = {}
     keyed_channels = 0
+    guarded_frames = 0
+    max_guard_correction = 0.0
 
     hidden_state = []
     for obj in (source, target):
@@ -464,6 +712,25 @@ def bake_retarget(
                     pose_bone.keyframe_insert("location", frame=frame, group=target_name)
                     keyed_channels += 1
 
+            corrected_bones, correction = _apply_end_effector_guard(
+                source,
+                target,
+                arm_guard_context,
+                alignment_q,
+            )
+            if corrected_bones:
+                for bone_name in corrected_bones:
+                    pose_bone = target.pose.bones[bone_name]
+                    last_quaternion[bone_name] = pose_bone.matrix_basis.to_quaternion().copy()
+                    if capture:
+                        pose_bone.keyframe_insert(
+                            _rotation_property(pose_bone),
+                            frame=frame,
+                            group=bone_name,
+                        )
+                if capture:
+                    guarded_frames += 1
+                    max_guard_correction = max(max_guard_correction, correction)
             bpy.context.view_layer.update()
     except Exception:
         if animation_data.action == action:
@@ -482,7 +749,14 @@ def bake_retarget(
         fcurve.update()
     scene.frame_set(frame_start)
     bpy.context.view_layer.update()
-    return BakeResult(action, frame_start, frame_end, keyed_channels)
+    return BakeResult(
+        action,
+        frame_start,
+        frame_end,
+        keyed_channels,
+        guarded_frames,
+        max_guard_correction,
+    )
 
 
 def _iter_action_fcurves(action):

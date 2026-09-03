@@ -78,6 +78,11 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
         description="在世界空间读取官方骨架的 Hips 位移，兼容对象层变换",
         default=True,
     )
+    use_end_effector_guard: BoolProperty(
+        name="肢端防穿模",
+        description="当不同体型使双手在近距离动作中额外收拢时，自动用双骨 IK 稳定腕点；按当前骨架比例计算，不使用特定角色偏移",
+        default=True,
+    )
     accept_preview_on_run: BoolProperty(
         name="一键时接受当前预览",
         description="Proscenium 正在预览时，先执行 Accept，再立即重定向到角色；Accept 成功后即使重定向失败，生成结果也会保留",

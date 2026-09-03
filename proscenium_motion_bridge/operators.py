@@ -1518,6 +1518,7 @@ class BAM_OT_retarget(bpy.types.Operator):
                 world_location=bool(settings.world_location),
                 motion_space=settings.motion_space,
                 placement=placement,
+                end_effector_guard=bool(settings.use_end_effector_guard),
                 progress=operation_progress.stage(0.18, 0.76, "重定向"),
             )
             created_action = bake_result.action
@@ -1536,6 +1537,9 @@ class BAM_OT_retarget(bpy.types.Operator):
             created_action["bam_previous_use_nla"] = bool(previous_use_nla)
             created_action["bam_engine"] = "Proscenium Motion Bridge Native"
             created_action["bam_motion_space"] = settings.motion_space
+            created_action["bam_end_effector_guard"] = bool(settings.use_end_effector_guard)
+            created_action["bam_guarded_frames"] = int(bake_result.guarded_frames)
+            created_action["bam_max_guard_correction"] = float(bake_result.max_guard_correction)
             created_action["bam_placement_bone"] = placement.placement_bone if placement else ""
             created_action["bam_alignment_yaw_degrees"] = (
                 placement.alignment_yaw_degrees if placement else 0.0
@@ -1623,7 +1627,13 @@ class BAM_OT_retarget(bpy.types.Operator):
                     buffer_note += f"；物理预热 {physics_result['evaluated_frames']} 帧"
             settings.status_message = (
                 f"完成：{created_action.name}；{result.target_profile}；"
-                f"暂时关闭 {disabled_constraints} 个相关约束{buffer_note}"
+                f"暂时关闭 {disabled_constraints} 个相关约束"
+                + (
+                    f"；肢端修正 {bake_result.guarded_frames} 帧"
+                    if settings.use_end_effector_guard and bake_result.guarded_frames
+                    else ""
+                )
+                + buffer_note
             )
             success = True
         except Exception as exc:
