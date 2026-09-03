@@ -1,6 +1,6 @@
 # Proscenium Motion Bridge 使用指南
 
-适用版本：Blender 5.1.2、Proscenium Motion Bridge 0.9.0、Proscenium 0.4.0、MMD Tools 4.5.13。BlendCap、BlendCap Motion Bridge 与 BA Animation Workflow 都不是本插件依赖。
+适用版本：Blender 5.1.2、Proscenium Motion Bridge 0.9.1、Proscenium 0.4.0、MMD Tools 4.5.13。BlendCap、BlendCap Motion Bridge 与 BA Animation Workflow 都不是本插件依赖。
 
 ## 为什么先用官方骨架
 
@@ -12,7 +12,7 @@ Proscenium 对自己的 `kimodo-soma-rp` 30 骨骨架最稳定。直接让模型
 自然语言 / 关键姿势 / Root Path
   → Proscenium 官方 kimodo-soma-rp
   → Preview
-  → 接受并输出到角色（Proscenium Motion Bridge 0.9.0）
+  → 接受并输出到角色（Proscenium Motion Bridge 0.9.1）
   → 独立 RETARGET Action
   → BA Workflow CLEAN / CORR
 ```
@@ -83,7 +83,7 @@ Auto-Rig Pro 目标会切换到专用控制器 profile：肩、上臂、前臂�
 
 ## 肢端防穿模
 
-官方骨架与目标人物即使姿态旋转完全一致，也可能因为肩宽、上臂、前臂和手掌比例不同，让目标双手比源动作更靠近。默认开启的“肢端防穿模”会逐帧比较源/目标双腕关系，只在目标双手发生额外收拢且进入近距离风险区时启动。
+官方骨架与目标人物即使姿态旋转完全一致，也可能因为肩宽、上臂、前臂和手掌比例不同，让目标双手比源动作更靠近。默认开启的“肢端防穿模”会逐帧比较源/目标双腕关系，只在目标双手发生额外收拢且进入近距离风险区时启动。同一行的“幅度”默认为 `1.00`：低于 `1.00` 会减弱修正，高于 `1.00` 会在比例腕点之外增加安全间距；建议从 `1.25` 或 `1.50` 逐步提高，最大 `3.00`，每次改变后需要重新输出动作。
 
 修正目标完全由当前源、目标骨架的角色映射、肩宽、两段手臂长度和手骨尺度计算，不包含任何模型名称或固定角色偏移。它使用保留当前肘弯平面的双骨 IK 调整上臂与前臂，支持腕捩/手捩等未映射中间骨，并在父链变化后恢复原手掌世界旋转。目标人物经过对象、父级或 `全ての親` 旋转时，腕点目标会使用同一动作空间对齐，因此不会退回世界原方向。
 

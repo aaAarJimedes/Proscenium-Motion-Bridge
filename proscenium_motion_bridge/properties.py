@@ -83,6 +83,17 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
         description="当不同体型使双手在近距离动作中额外收拢时，自动用双骨 IK 稳定腕点；按当前骨架比例计算，不使用特定角色偏移",
         default=True,
     )
+    end_effector_guard_strength: FloatProperty(
+        name="修正幅度",
+        description="1.0 为按源动作比例恢复腕点；低于 1.0 更柔和，高于 1.0 额外增加安全间距；极端值仍受手臂可达范围限制",
+        default=1.0,
+        min=0.25,
+        max=3.0,
+        soft_min=0.5,
+        soft_max=2.0,
+        step=10,
+        precision=2,
+    )
     accept_preview_on_run: BoolProperty(
         name="一键时接受当前预览",
         description="Proscenium 正在预览时，先执行 Accept，再立即重定向到角色；Accept 成功后即使重定向失败，生成结果也会保留",

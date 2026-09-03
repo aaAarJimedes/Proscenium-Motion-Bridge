@@ -1519,6 +1519,7 @@ class BAM_OT_retarget(bpy.types.Operator):
                 motion_space=settings.motion_space,
                 placement=placement,
                 end_effector_guard=bool(settings.use_end_effector_guard),
+                end_effector_guard_strength=float(settings.end_effector_guard_strength),
                 progress=operation_progress.stage(0.18, 0.76, "重定向"),
             )
             created_action = bake_result.action
@@ -1538,6 +1539,9 @@ class BAM_OT_retarget(bpy.types.Operator):
             created_action["bam_engine"] = "Proscenium Motion Bridge Native"
             created_action["bam_motion_space"] = settings.motion_space
             created_action["bam_end_effector_guard"] = bool(settings.use_end_effector_guard)
+            created_action["bam_end_effector_guard_strength"] = float(
+                settings.end_effector_guard_strength
+            )
             created_action["bam_guarded_frames"] = int(bake_result.guarded_frames)
             created_action["bam_max_guard_correction"] = float(bake_result.max_guard_correction)
             created_action["bam_placement_bone"] = placement.placement_bone if placement else ""

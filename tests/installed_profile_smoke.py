@@ -28,12 +28,12 @@ if state != (True, True):
 
 module = importlib.import_module(module_name)
 constants = importlib.import_module(module_name + ".constants")
-if tuple(constants.ADDON_VERSION) != (0, 9, 0):
+if tuple(constants.ADDON_VERSION) != (0, 9, 1):
     raise RuntimeError(f"Unexpected runtime version: {constants.ADDON_VERSION}")
 
 manifest_path = Path(module.__file__).resolve().parent / "blender_manifest.toml"
 manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
-if manifest.get("version") != "0.9.0":
+if manifest.get("version") != "0.9.1":
     raise RuntimeError(f"Unexpected installed manifest version: {manifest.get('version')}")
 
 if not hasattr(bpy.types.Scene, "ba_motion_bridge_settings"):
@@ -43,6 +43,8 @@ if settings.motion_space != "TARGET_PLACEMENT":
     raise RuntimeError(f"Unexpected default motion space: {settings.motion_space}")
 if not settings.use_end_effector_guard:
     raise RuntimeError("End-effector guard is not enabled by default")
+if abs(settings.end_effector_guard_strength - 1.0) > 1e-6:
+    raise RuntimeError(f"Unexpected end-effector guard strength: {settings.end_effector_guard_strength}")
 
 try:
     bpy.ops.ba_motion_bridge.accept_and_retarget.get_rna_type()
@@ -62,6 +64,7 @@ print(
             "version": manifest["version"],
             "motion_space": settings.motion_space,
             "end_effector_guard": settings.use_end_effector_guard,
+            "end_effector_guard_strength": settings.end_effector_guard_strength,
         },
         ensure_ascii=False,
         sort_keys=True,

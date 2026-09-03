@@ -114,7 +114,7 @@ pose_arm(source, "Left", Vector((0.34, 0.30, 1.35)), Vector((0.12, 0.16, 1.18)))
 pose_arm(source, "Right", Vector((-0.34, 0.30, 1.35)), Vector((-0.12, 0.16, 1.18)))
 
 
-def exercise_target(name: str, yaw_degrees: float):
+def exercise_target(name: str, yaw_degrees: float, correction_strength: float = 1.0):
     target = make_rig(name, 0.35, 0.40, 0.38, intermediate_twists=True)
     target.location = (2.0, -3.0, 0.0)
     target.rotation_euler.z = math.radians(yaw_degrees)
@@ -135,6 +135,7 @@ def exercise_target(name: str, yaw_degrees: float):
         target,
         context,
         Quaternion((0.0, 0.0, 1.0), math.radians(yaw_degrees)),
+        correction_strength,
     )
     after = wrist_separation(target)
     for side in ("Left", "Right"):
@@ -153,11 +154,17 @@ def exercise_target(name: str, yaw_degrees: float):
 
 neutral, neutral_before, neutral_after, neutral_wrists = exercise_target("NeutralTarget", 0.0)
 rotated, rotated_before, rotated_after, rotated_wrists = exercise_target("RotatedTarget", 137.0)
+strong, strong_before, strong_after, _strong_wrists = exercise_target("StrongTarget", 0.0, 2.0)
 for neutral_wrist, rotated_wrist in zip(neutral_wrists, rotated_wrists):
     check((neutral_wrist - rotated_wrist).length < 1e-5, "Target placement changed local guard result")
+check(strong_after > neutral_after + 0.02, "Higher correction strength did not add clearance")
 
 addon.register()
 check(bpy.context.scene.ba_motion_bridge_settings.use_end_effector_guard, "Guard is not enabled by default")
+check(
+    abs(bpy.context.scene.ba_motion_bridge_settings.end_effector_guard_strength - 1.0) < 1e-6,
+    "Guard strength does not default to 1.0",
+)
 
 print(
     "PMB_END_EFFECTOR_GUARD_TEST="
@@ -166,8 +173,10 @@ print(
             "status": "PASS",
             "neutral": [neutral_before, neutral_after],
             "rotated": [rotated_before, rotated_after],
+            "strong": [strong_before, strong_after],
             "rotation_invariant": True,
             "default_enabled": True,
+            "default_strength": 1.0,
         },
         sort_keys=True,
     )

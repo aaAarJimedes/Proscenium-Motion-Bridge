@@ -424,9 +424,16 @@ def _solve_two_bone_arm(target, chain: _ArmGuardChain, goal_world: Vector) -> tu
     return chain.target_upper, chain.target_forearm, chain.target_hand
 
 
-def _apply_end_effector_guard(source, target, guard_context, alignment: Quaternion):
+def _apply_end_effector_guard(
+    source,
+    target,
+    guard_context,
+    alignment: Quaternion,
+    correction_strength: float = 1.0,
+):
     """Correct only extra near-contact convergence introduced by proportions."""
-    if guard_context is None:
+    correction_strength = max(0.0, min(3.0, float(correction_strength)))
+    if guard_context is None or correction_strength <= 1e-4:
         return (), 0.0
     chains, spatial_scale = guard_context
     source_shoulders = [
@@ -471,8 +478,11 @@ def _apply_end_effector_guard(source, target, guard_context, alignment: Quaterni
 
     corrected: list[str] = []
     max_correction = 0.0
+    applied_strength = min(3.0, strength * correction_strength)
     for chain, current, goal in zip(chains, target_wrists, goals):
-        blended_goal = current.lerp(goal, strength)
+        # Values above 1.0 intentionally extrapolate beyond the proportional
+        # source wrist goal to provide extra clearance for bulky hands/sleeves.
+        blended_goal = current.lerp(goal, applied_strength)
         max_correction = max(max_correction, (blended_goal - current).length)
         corrected.extend(_solve_two_bone_arm(target, chain, blended_goal))
     return tuple(dict.fromkeys(corrected)), max_correction
@@ -490,6 +500,7 @@ def bake_retarget(
     motion_space: str = _TARGET_PLACEMENT,
     placement: PlacementContext | None = None,
     end_effector_guard: bool = True,
+    end_effector_guard_strength: float = 1.0,
     progress=None,
 ) -> BakeResult:
     """Bake Proscenium motion without reading or mutating another add-on.
@@ -717,6 +728,7 @@ def bake_retarget(
                 target,
                 arm_guard_context,
                 alignment_q,
+                end_effector_guard_strength,
             )
             if corrected_bones:
                 for bone_name in corrected_bones:
