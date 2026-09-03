@@ -38,6 +38,8 @@ _PLACEMENT_BONE_NAMES = (
     "c_pos",
     "c_traj",
     "c_root_master.x",
+)
+_FALLBACK_PLACEMENT_BONE_NAMES = (
     "センター",
     "center",
     "グルーブ",
@@ -114,14 +116,21 @@ def _yaw_between(source_rotation: Quaternion, target_rotation: Quaternion) -> Qu
 
 
 def _placement_bone_name(target, result: MappingResult) -> str:
-    # The horizontal root-motion control is the best reference because its
-    # evaluated pose contains every manually transformed ancestor as well.
+    lookup = {bone.name.casefold(): bone.name for bone in target.data.bones}
+    # Prefer a dedicated world/placement control. Unlike Center/Groove, this
+    # bone is normally not animated by a previous retarget output, so its
+    # evaluated pose is a stable statement of the user's scene placement.
+    for candidate in _PLACEMENT_BONE_NAMES:
+        name = lookup.get(candidate.casefold())
+        if name is not None:
+            return name
+
+    # Minimal rigs may only expose the mapped horizontal root. Keep that
+    # useful fallback, but do not let it outrank a dedicated placement bone.
     for pair in result.pairs:
         if pair.role == "root_xy" and pair.target in target.pose.bones:
             return pair.target
-
-    lookup = {bone.name.casefold(): bone.name for bone in target.data.bones}
-    for candidate in _PLACEMENT_BONE_NAMES:
+    for candidate in _FALLBACK_PLACEMENT_BONE_NAMES:
         name = lookup.get(candidate.casefold())
         if name is not None:
             return name

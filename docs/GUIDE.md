@@ -1,6 +1,6 @@
 # Proscenium Motion Bridge 使用指南
 
-适用版本：Blender 5.1.2、Proscenium Motion Bridge 0.8.0、Proscenium 0.4.0、MMD Tools 4.5.13。BlendCap、BlendCap Motion Bridge 与 BA Animation Workflow 都不是本插件依赖。
+适用版本：Blender 5.1.2、Proscenium Motion Bridge 0.8.1、Proscenium 0.4.0、MMD Tools 4.5.13。BlendCap、BlendCap Motion Bridge 与 BA Animation Workflow 都不是本插件依赖。
 
 ## 为什么先用官方骨架
 
@@ -12,7 +12,7 @@ Proscenium 对自己的 `kimodo-soma-rp` 30 骨骨架最稳定。直接让模型
 自然语言 / 关键姿势 / Root Path
   → Proscenium 官方 kimodo-soma-rp
   → Preview
-  → 接受并输出到角色（Proscenium Motion Bridge 0.8.0）
+  → 接受并输出到角色（Proscenium Motion Bridge 0.8.1）
   → 独立 RETARGET Action
   → BA Workflow CLEAN / CORR
 ```
@@ -101,7 +101,7 @@ Root 位移比例取髋—头、髋—左右脚、肩—左右手等身体 landm
 
 ## 目标初始布置与动作方向
 
-`跟随目标初始布置` 会在输出前冻结角色的布置锚点：Armature 对象及父级的最终世界矩阵，以及可用的 MMD/ARP 根控制骨基线。插件只取两套骨架之间的水平朝向差，不把角色的俯仰或侧倾混入重力方向。
+`跟随目标初始布置` 会在输出前冻结角色的布置锚点：Armature 对象及父级的最终世界矩阵，以及可用的 MMD/ARP 根控制骨基线。插件只取两套骨架之间的水平朝向差，不把角色的俯仰或侧倾混入重力方向。静置方向校正会先回到源骨架朝向坐标系，避免对象/父级旋转在全身动作上被重复计算；MMD 骨架存在 `全ての親` 时优先把它作为稳定布置控制，只有精简骨架没有专用控制时才回退到 `センター／グルーブ`。
 
 - 全身旋转增量会转入目标人物自己的朝向，因此转身 180° 的人物仍会朝自身前方走、向自身左右伸手；
 - Root XY 随目标朝向旋转，Root Z 始终保持世界竖直；

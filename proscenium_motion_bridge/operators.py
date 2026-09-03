@@ -717,7 +717,12 @@ def _twist_about_bone_y(rotation: Quaternion) -> Quaternion:
     return twist
 
 
-def _build_source_rest_override(source, target, result: MappingResult) -> dict[str, Matrix]:
+def _build_source_rest_override(
+    source,
+    target,
+    result: MappingResult,
+    placement=None,
+) -> dict[str, Matrix]:
     """Build source rest matrices with selected limb direction swing removed.
 
     The canonical source rests in a T-pose while many converted MMD/ARP rigs
@@ -741,16 +746,24 @@ def _build_source_rest_override(source, target, result: MappingResult) -> dict[s
     source_world_q = source.matrix_world.to_quaternion()
     source_world_q_inv = source_world_q.inverted()
     target_world_q = target.matrix_world.to_quaternion()
+    placement_alignment_inverse = Quaternion()
+    if placement is not None and placement.motion_space == "TARGET_PLACEMENT":
+        placement_alignment_inverse = placement.alignment_rotation.inverted()
     overrides: dict[str, Matrix] = {}
     for pair in rotation_pairs:
         source_bone = source.data.bones[pair.source]
         target_bone = target.data.bones[pair.target]
         source_rest_world_q = source_world_q @ source_bone.matrix_local.to_quaternion()
         target_rest_world_q = target_world_q @ target_bone.matrix_local.to_quaternion()
+        # Limb rest-direction matching is a shape correction, not scene
+        # placement. Compare both rigs in the source-facing frame; otherwise
+        # the target object's yaw is included here and then applied a second
+        # time by bake_retarget's target-placement alignment.
+        comparable_target_rest_q = placement_alignment_inverse @ target_rest_world_q
         if pair.role in _DIRECTION_ALIGNED_ROLES:
-            rest_offset = source_rest_world_q.inverted() @ target_rest_world_q
+            rest_offset = source_rest_world_q.inverted() @ comparable_target_rest_q
             roll_twist = _twist_about_bone_y(rest_offset)
-            override_world_q = target_rest_world_q @ roll_twist.inverted()
+            override_world_q = comparable_target_rest_q @ roll_twist.inverted()
         else:
             override_world_q = source_rest_world_q
 
@@ -1494,7 +1507,7 @@ class BAM_OT_retarget(bpy.types.Operator):
             animation_data.use_nla = False
             _force_target_fk_switches(target)
 
-            source_rest_override = _build_source_rest_override(source, target, result)
+            source_rest_override = _build_source_rest_override(source, target, result, placement)
             bake_result = bake_retarget(
                 scene,
                 source,

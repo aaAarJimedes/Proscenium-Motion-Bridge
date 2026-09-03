@@ -22,6 +22,7 @@ MODULE_NAME = os.environ.get("PMB_MODULE", "proscenium_motion_bridge")
 sys.path.insert(0, str(IMPORT_ROOT))
 mapping = importlib.import_module(MODULE_NAME + ".mapping")
 native = importlib.import_module(MODULE_NAME + ".retarget")
+bridge_ops = importlib.import_module(MODULE_NAME + ".operators")
 
 
 def check(condition: bool, message: str) -> None:
@@ -130,12 +131,13 @@ bpy.context.view_layer.update()
 object_matrix_before = target.matrix_world.copy()
 placement = native.capture_placement_context(source, target, RESULT, "TARGET_PLACEMENT")
 check(abs(abs(placement.alignment_yaw_degrees) - 180.0) < 0.01, "180-degree target alignment was not captured")
+placed_rest_override = bridge_ops._build_source_rest_override(source, target, RESULT, placement)
 native.bake_retarget(
     bpy.context.scene,
     source,
     target,
     RESULT,
-    source_rest_override=None,
+    source_rest_override=placed_rest_override,
     location_scale=1.5,
     world_location=True,
     motion_space="TARGET_PLACEMENT",
