@@ -1,6 +1,6 @@
 # Proscenium Motion Bridge 使用指南
 
-适用版本：Blender 5.1.2、Proscenium Motion Bridge 0.7.0、BA Animation Workflow 0.3.2、Proscenium 0.4.0、MMD Tools 4.5.13。BlendCap 与 BlendCap Motion Bridge 仅属于另一条传统 BVH 工作流，不是本插件依赖。
+适用版本：Blender 5.1.2、Proscenium Motion Bridge 0.8.0、Proscenium 0.4.0、MMD Tools 4.5.13。BlendCap、BlendCap Motion Bridge 与 BA Animation Workflow 都不是本插件依赖。
 
 ## 为什么先用官方骨架
 
@@ -12,7 +12,7 @@ Proscenium 对自己的 `kimodo-soma-rp` 30 骨骨架最稳定。直接让模型
 自然语言 / 关键姿势 / Root Path
   → Proscenium 官方 kimodo-soma-rp
   → Preview
-  → 接受并输出到角色（Proscenium Motion Bridge 0.7.0）
+  → 接受并输出到角色（Proscenium Motion Bridge 0.8.0）
   → 独立 RETARGET Action
   → BA Workflow CLEAN / CORR
 ```
@@ -33,6 +33,8 @@ BlendCap Motion Bridge 针对常见 BVH：`LeftUpLeg=大腿`、`LeftLeg=小腿`�
    - `自动跟随 Proscenium`：读取 Proscenium 的 In-place 开关；
    - `完整位移`：身体旋转 + Root XY/Z，共 24 对；此时才显示体型比例与世界空间位移；
    - `原地动作`：不传 Root 位移，共 22 对。
+
+   “动作空间”默认选择 `跟随目标初始布置`：目标人物提前移动、转向或放在父级 Empty 下时，动作的前后左右会跟随人物自身朝向；MMD `全ての親／センター` 等根控制骨的现有位置也会作为叠加基线保留。仅在复现 0.7 及更早版本时选择 `保持官方世界方向`。
 
 7. 点“自动识别并检查”。没有关键缺失且显示 `24/24` 或 `22/22` 才继续；需要时可点“复查”。
 8. Preview 满意后直接点“接受并输出到角色”。Bridge 会先 Accept，再自动检查并重定向；动作已 Accept 时按钮显示“一键输出到角色”。
@@ -96,6 +98,18 @@ Bridge 使用自有的依赖图世界空间 bake 和内部 SOMA 映射表，并�
 源和目标对象必须是等比缩放。检测到非等比缩放会停止，避免位置和骨长失真。
 
 Root 位移比例取髋—头、髋—左右脚、肩—左右手等身体 landmark 比值的中位数，不扫描全部 MMD 骨，因此光环、武器、翅膀和长发不会污染身高。
+
+## 目标初始布置与动作方向
+
+`跟随目标初始布置` 会在输出前冻结角色的布置锚点：Armature 对象及父级的最终世界矩阵，以及可用的 MMD/ARP 根控制骨基线。插件只取两套骨架之间的水平朝向差，不把角色的俯仰或侧倾混入重力方向。
+
+- 全身旋转增量会转入目标人物自己的朝向，因此转身 180° 的人物仍会朝自身前方走、向自身左右伸手；
+- Root XY 随目标朝向旋转，Root Z 始终保持世界竖直；
+- 已布置的对象位置、旋转、等比缩放不会被写关键帧或拉回原点；
+- `全ての親／センター／グルーブ` 等根控制骨的已有位移作为基线，输出根运动叠加在其上；
+- 原地动作虽然不输出 Root 位移，肢体动作方向仍会跟随目标朝向。
+
+`保持官方世界方向` 完整保留旧行为：动作增量沿 Proscenium 官方骨架的世界坐标方向输出。它适合已有工程兼容，不建议用于已经在场景中转向的角色。
 
 ## 非破坏与恢复按钮
 

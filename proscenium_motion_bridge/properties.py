@@ -14,7 +14,7 @@ def _invalidate_mapping(self, _context):
     self.status_level = "INFO"
     self.status_code = "MAPPING_STALE"
     self.next_action = "点击“自动识别并检查”"
-    self.status_message = "骨架或位移模式已变化，请重新自动映射"
+    self.status_message = "骨架、位移或动作空间已变化，请重新自动映射"
 
 
 class BAM_PG_settings(bpy.types.PropertyGroup):
@@ -48,6 +48,24 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
             ("IN_PLACE", "原地动作", "不传递 Hips 的水平整体位移"),
         ),
         default="AUTO",
+        update=_invalidate_mapping,
+    )
+    motion_space: EnumProperty(
+        name="动作空间",
+        description="决定动作方向是跟随角色当前布置，还是保持 Proscenium 官方骨架的世界方向",
+        items=(
+            (
+                "TARGET_PLACEMENT",
+                "跟随目标初始布置",
+                "保留角色当前位置与水平朝向；前进、侧移和肢体动作都相对角色自身方向",
+            ),
+            (
+                "SOURCE_WORLD",
+                "保持官方世界方向",
+                "兼容 0.7 及更早行为；动作继续沿官方骨架的世界坐标方向",
+            ),
+        ),
+        default="TARGET_PLACEMENT",
         update=_invalidate_mapping,
     )
     auto_scale: BoolProperty(

@@ -11,6 +11,7 @@
 | `v0.5.0` | `proscenium_motion_bridge-0.5.0.zip` | 32,922 | `d000a5733e85a608e460675472f46e77b126bda3f9543b2d42c0b0ace7456cee` |
 | `v0.6.0` | `proscenium_motion_bridge-0.6.0.zip` | 32,284 | `9a9d5994ced9df1d3d20b183f28d218014215b7945c75aaa3bbc7d60b2dfaed8` |
 | `v0.7.0` | `proscenium_motion_bridge-0.7.0.zip` | 35,338 | `aa9e260c0006b9c3177e0b975e7926c54bfe0502735e6b710bfb28639d5692ac` |
+| `v0.8.0` | `proscenium_motion_bridge-0.8.0.zip` | 37,628 | `86c6817e43319d365c622a80c2985435d212e75ad456c7591cd482b17d538911` |
 
 ## Version highlights
 
@@ -21,3 +22,4 @@
 - `v0.5.0`：合并根运动策略；支持多角色安全切换与负帧 Preview Range/物理缓存起点。
 - `v0.6.0`：采用插件自有映射和原生重定向器，移除 BlendCap 依赖；修复 ToeBase → MMD 脚尖骨轴问题。
 - `v0.7.0`：加入输出/重新激活进度反馈，优化窄面板布局、说明文字与多角色重新激活安全性。
+- `v0.8.0`：新增目标初始布置动作空间；全身动作与根位移跟随角色朝向，保留对象/父级及 MMD 根控制骨的位置、旋转和等比缩放，同时提供旧版世界方向兼容模式。

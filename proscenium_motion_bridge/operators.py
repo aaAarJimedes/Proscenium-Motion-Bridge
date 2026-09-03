@@ -8,7 +8,7 @@ import time
 
 import bpy
 from bpy.props import EnumProperty, StringProperty
-from mathutils import Matrix, Quaternion
+from mathutils import Matrix, Quaternion, Vector
 
 from .constants import (
     CANONICAL_MODEL_ID,
@@ -19,7 +19,7 @@ from .constants import (
     TEMPORARY_KEY,
 )
 from .mapping import MappingResult, build_mapping, is_official_canonical_bones, normalize
-from .retarget import bake_retarget
+from .retarget import bake_retarget, capture_placement_context
 
 
 class _OperationProgress:
@@ -322,14 +322,21 @@ def _rig_fingerprint(rig) -> list[dict]:
     return result
 
 
-def _mapping_payload(source, target, root_motion_mode: str, result: MappingResult) -> dict:
+def _mapping_payload(
+    source,
+    target,
+    root_motion_mode: str,
+    motion_space: str,
+    result: MappingResult,
+) -> dict:
     return {
-        "schema": 2,
+        "schema": 3,
         "source_object": source.name,
         "source_data": source.data.name,
         "target_object": target.name,
         "target_data": target.data.name,
         "root_motion_mode": root_motion_mode,
+        "motion_space": motion_space,
         "pairs": [pair.to_dict() for pair in result.pairs],
         "missing": list(result.missing),
         "critical_missing": list(result.critical_missing),
@@ -459,7 +466,13 @@ def _prepare_mapping(scene, settings):
 
     result = build_mapping(source, target, settings.root_motion_mode)
     settings.scale_ratio = _semantic_scale_ratio(source, target, result)
-    payload = _mapping_payload(source, target, settings.root_motion_mode, result)
+    payload = _mapping_payload(
+        source,
+        target,
+        settings.root_motion_mode,
+        settings.motion_space,
+        result,
+    )
     signature = _mapping_signature(source, target, payload)
     settings.mapping_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     settings.mapping_signature = signature
@@ -858,12 +871,28 @@ def _snapshot_pose_basis(target, bone_names: set[str]) -> dict[str, Matrix]:
     }
 
 
-def _capture_buffer_initial_pose(scene, settings, target, result: MappingResult) -> dict[str, Matrix]:
+def _capture_buffer_initial_pose(
+    scene,
+    settings,
+    target,
+    result: MappingResult,
+    placement=None,
+) -> dict[str, Matrix]:
     """Read the user-selected initial pose without changing target animation state."""
     rotation_targets, location_targets = _mapped_target_channels(result)
     bone_names = rotation_targets | location_targets
     if settings.initial_pose_source == "REST":
-        return {name: Matrix.Identity(4) for name in bone_names if name in target.pose.bones}
+        rest_pose = {name: Matrix.Identity(4) for name in bone_names if name in target.pose.bones}
+        if placement is not None and placement.motion_space == "TARGET_PLACEMENT":
+            for name in location_targets:
+                if name not in rest_pose:
+                    continue
+                rest_pose[name].translation = placement.baseline_locations.get(name, Vector()).copy()
+            if placement.placement_bone in rest_pose:
+                baseline = placement.baseline_basis.get(placement.placement_bone)
+                if baseline is not None:
+                    rest_pose[placement.placement_bone] = baseline.copy()
+        return rest_pose
 
     animation_data = target.animation_data_create()
     if settings.initial_pose_source == "CURRENT":
@@ -1412,6 +1441,7 @@ class BAM_OT_retarget(bpy.types.Operator):
         initial_pose: dict[str, Matrix] = {}
         buffer_result = None
         physics_result = {"status": "DISABLED", "evaluated_frames": 0}
+        placement = None
         source_motion = "Proscenium_Motion"
         new_snapshot_written = False
         error_message = ""
@@ -1437,8 +1467,21 @@ class BAM_OT_retarget(bpy.types.Operator):
                 previous_action_fake_user = bool(previous_action.use_fake_user)
                 previous_action.use_fake_user = True
 
+            placement = capture_placement_context(
+                source,
+                target,
+                result,
+                settings.motion_space,
+            )
+
             if settings.use_start_buffer and (settings.settle_frames + settings.transition_frames) > 0:
-                initial_pose = _capture_buffer_initial_pose(scene, settings, target, result)
+                initial_pose = _capture_buffer_initial_pose(
+                    scene,
+                    settings,
+                    target,
+                    result,
+                    placement,
+                )
 
             before_actions = {action.as_pointer() for action in bpy.data.actions}
             _restored, restore_missing = _restore_saved_constraints(settings)
@@ -1460,6 +1503,8 @@ class BAM_OT_retarget(bpy.types.Operator):
                 source_rest_override=source_rest_override,
                 location_scale=settings.scale_ratio if settings.auto_scale else 1.0,
                 world_location=bool(settings.world_location),
+                motion_space=settings.motion_space,
+                placement=placement,
                 progress=operation_progress.stage(0.18, 0.76, "重定向"),
             )
             created_action = bake_result.action
@@ -1477,6 +1522,11 @@ class BAM_OT_retarget(bpy.types.Operator):
             created_action["bam_previous_action_slot"] = previous_action_slot_identifier
             created_action["bam_previous_use_nla"] = bool(previous_use_nla)
             created_action["bam_engine"] = "Proscenium Motion Bridge Native"
+            created_action["bam_motion_space"] = settings.motion_space
+            created_action["bam_placement_bone"] = placement.placement_bone if placement else ""
+            created_action["bam_alignment_yaw_degrees"] = (
+                placement.alignment_yaw_degrees if placement else 0.0
+            )
             created_action["bam_disabled_constraint_count"] = disabled_constraints
 
             if settings.use_start_buffer and (settings.settle_frames + settings.transition_frames) > 0:
