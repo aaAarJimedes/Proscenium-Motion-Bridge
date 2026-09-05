@@ -1,37 +1,7 @@
 import bpy
-from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 
 from .constants import ROOT_MOTION_ITEMS
-
-
-_BUFFER_SCHEMA_KEY = "bam_buffer_frame_schema"
-_BUFFER_SCHEMA_VERSION = 2
-
-
-def _mark_buffer_schema(self, _context):
-    self[_BUFFER_SCHEMA_KEY] = _BUFFER_SCHEMA_VERSION
-
-
-def _migrate_buffer_settings(scene) -> None:
-    settings = getattr(scene, "ba_motion_bridge_settings", None)
-    if settings is None or int(settings.get(_BUFFER_SCHEMA_KEY, 0)) >= _BUFFER_SCHEMA_VERSION:
-        return
-
-    # 0.9.1 stored the static hold and transition as two additive values.
-    # Preserve its actual total pre-roll when opening an older .blend, while
-    # exposing that total directly as the new Buffer Frames value.
-    if "buffer_frames" not in settings:
-        legacy_settle = max(0, int(getattr(settings, "settle_frames", 10)))
-        legacy_transition = max(0, int(getattr(settings, "transition_frames", 20)))
-        settings.buffer_frames = legacy_settle + legacy_transition
-    settings[_BUFFER_SCHEMA_KEY] = _BUFFER_SCHEMA_VERSION
-
-
-@persistent
-def _migrate_buffer_settings_on_load(_unused) -> None:
-    for scene in bpy.data.scenes:
-        _migrate_buffer_settings(scene)
 
 
 def _armature_poll(_self, obj):
@@ -162,29 +132,19 @@ class BAM_PG_settings(bpy.types.PropertyGroup):
         min=-1048574,
         max=1048574,
     )
-    buffer_frames: IntProperty(
-        name="缓冲帧",
-        description="正式动作首帧之前的负帧总边距；过渡帧包含在其中，剩余部分保持初始姿态",
-        default=30,
-        min=0,
-        max=1000,
-        update=_mark_buffer_schema,
-    )
     settle_frames: IntProperty(
-        name="旧版静置帧",
-        description="仅用于把 0.9.1 及更早工程迁移到缓冲帧语义",
+        name="静置帧",
+        description="保持初始姿态、让裙发刚体稳定的帧数；设为 0 可跳过",
         default=10,
         min=0,
         max=1000,
-        options={"HIDDEN"},
     )
     transition_frames: IntProperty(
         name="过渡帧",
-        description="缓冲尾部用于从初始姿态平滑进入正式首帧的帧数；超过缓冲帧时按缓冲帧计算",
+        description="从初始姿态逐帧平滑进入正式动作首帧的帧数；设为 0 可跳过",
         default=20,
         min=0,
         max=1000,
-        update=_mark_buffer_schema,
     )
     evaluate_physics_preroll: BoolProperty(
         name="顺序预热物理",
@@ -260,17 +220,9 @@ def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.ba_motion_bridge_settings = PointerProperty(type=BAM_PG_settings)
-    if _migrate_buffer_settings_on_load not in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.append(_migrate_buffer_settings_on_load)
-    # During extension startup bpy.data can be _RestrictData; load_post performs
-    # the migration once the real scene collection becomes available.
-    for scene in getattr(bpy.data, "scenes", ()):
-        _migrate_buffer_settings(scene)
 
 
 def unregister():
-    if _migrate_buffer_settings_on_load in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.remove(_migrate_buffer_settings_on_load)
     if hasattr(bpy.types.Scene, "ba_motion_bridge_settings"):
         del bpy.types.Scene.ba_motion_bridge_settings
     for cls in reversed(CLASSES):

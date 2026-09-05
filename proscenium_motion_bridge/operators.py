@@ -961,26 +961,23 @@ def _insert_start_buffer(
     action,
     result: MappingResult,
     initial_pose: dict[str, Matrix],
-    buffer_frames: int,
+    settle_frames: int,
     transition_frames: int,
     progress=None,
 ) -> dict:
     """Add hidden pre-roll keys while preserving the formal motion range."""
-    buffer_frames = max(0, int(buffer_frames))
-    transition_frames = min(buffer_frames, max(0, int(transition_frames)))
-    settle_frames = buffer_frames - transition_frames
+    settle_frames = max(0, int(settle_frames))
+    transition_frames = max(0, int(transition_frames))
+    total_frames = settle_frames + transition_frames
     raw_start, raw_end = (float(value) for value in action.frame_range)
     motion_start = int(round(raw_start))
     motion_end = int(round(raw_end))
-    if buffer_frames <= 0:
+    if total_frames <= 0:
         return {
             "motion_start": motion_start,
             "motion_end": motion_end,
             "preroll_start": motion_start,
             "inserted_frames": 0,
-            "buffer_frames": 0,
-            "settle_frames": 0,
-            "transition_frames": 0,
         }
 
     rotation_targets, location_targets = _mapped_target_channels(result)
@@ -992,7 +989,7 @@ def _insert_start_buffer(
     if missing:
         raise RuntimeError("起始缓冲无法读取目标骨姿态：" + "、".join(missing[:8]))
 
-    preroll_start = motion_start - buffer_frames
+    preroll_start = motion_start - total_frames
     transition_start = motion_start - transition_frames
     if progress is not None:
         progress(0.0, "准备首帧缓冲")
@@ -1013,7 +1010,7 @@ def _insert_start_buffer(
                 pose_bone.keyframe_insert("location", frame=frame, group=bone_name)
         if progress is not None:
             progress(
-                (frame - preroll_start + 1) / max(1, buffer_frames),
+                (frame - preroll_start + 1) / max(1, total_frames),
                 f"写入缓冲帧 {frame}/{motion_start - 1}",
             )
 
@@ -1036,10 +1033,7 @@ def _insert_start_buffer(
         "motion_start": motion_start,
         "motion_end": motion_end,
         "preroll_start": preroll_start,
-        "inserted_frames": buffer_frames,
-        "buffer_frames": buffer_frames,
-        "settle_frames": settle_frames,
-        "transition_frames": transition_frames,
+        "inserted_frames": total_frames,
     }
 
 
@@ -1493,7 +1487,7 @@ class BAM_OT_retarget(bpy.types.Operator):
                 settings.motion_space,
             )
 
-            if settings.use_start_buffer and settings.buffer_frames > 0:
+            if settings.use_start_buffer and (settings.settle_frames + settings.transition_frames) > 0:
                 initial_pose = _capture_buffer_initial_pose(
                     scene,
                     settings,
@@ -1556,23 +1550,22 @@ class BAM_OT_retarget(bpy.types.Operator):
             )
             created_action["bam_disabled_constraint_count"] = disabled_constraints
 
-            if settings.use_start_buffer and settings.buffer_frames > 0:
+            if settings.use_start_buffer and (settings.settle_frames + settings.transition_frames) > 0:
                 buffer_result = _insert_start_buffer(
                     scene,
                     target,
                     created_action,
                     result,
                     initial_pose,
-                    settings.buffer_frames,
+                    settings.settle_frames,
                     settings.transition_frames,
                     progress=operation_progress.stage(0.79, 0.90, "起始缓冲"),
                 )
                 created_action["bam_motion_frame_start"] = buffer_result["motion_start"]
                 created_action["bam_motion_frame_end"] = buffer_result["motion_end"]
                 created_action["bam_preroll_frame_start"] = buffer_result["preroll_start"]
-                created_action["bam_preroll_buffer_frames"] = buffer_result["buffer_frames"]
-                created_action["bam_preroll_settle_frames"] = buffer_result["settle_frames"]
-                created_action["bam_preroll_transition_frames"] = buffer_result["transition_frames"]
+                created_action["bam_preroll_settle_frames"] = int(settings.settle_frames)
+                created_action["bam_preroll_transition_frames"] = int(settings.transition_frames)
                 created_action["bam_initial_pose_source"] = settings.initial_pose_source
                 if settings.evaluate_physics_preroll:
                     physics_result = _evaluate_physics_preroll(
@@ -1582,14 +1575,7 @@ class BAM_OT_retarget(bpy.types.Operator):
                         progress=operation_progress.stage(0.91, 0.98, "物理预热"),
                     )
                 else:
-                    timeline_result = _extend_preroll_timeline(
-                        scene, buffer_result["preroll_start"]
-                    )
-                    physics_result = {
-                        "status": "SKIPPED",
-                        "evaluated_frames": 0,
-                        "timeline_start": timeline_result["timeline_start"],
-                    }
+                    _extend_preroll_timeline(scene, buffer_result["preroll_start"])
                 created_action["bam_physics_preroll_status"] = physics_result["status"]
                 created_action["bam_physics_preroll_frames"] = int(physics_result["evaluated_frames"])
                 created_action["bam_timeline_frame_start"] = int(buffer_result["preroll_start"])
