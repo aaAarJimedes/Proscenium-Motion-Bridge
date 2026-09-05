@@ -1,6 +1,6 @@
 # Proscenium Motion Bridge 使用指南
 
-适用版本：Blender 5.1.2、Proscenium Motion Bridge 0.9.1、Proscenium 0.4.0、MMD Tools 4.5.13。BlendCap、BlendCap Motion Bridge 与 BA Animation Workflow 都不是本插件依赖。
+适用版本：Blender 5.1.2、Proscenium Motion Bridge 0.9.2、Proscenium 0.4.0、MMD Tools 4.5.13。BlendCap、BlendCap Motion Bridge 与 BA Animation Workflow 都不是本插件依赖。
 
 ## 为什么先用官方骨架
 
@@ -12,7 +12,7 @@ Proscenium 对自己的 `kimodo-soma-rp` 30 骨骨架最稳定。直接让模型
 自然语言 / 关键姿势 / Root Path
   → Proscenium 官方 kimodo-soma-rp
   → Preview
-  → 接受并输出到角色（Proscenium Motion Bridge 0.9.1）
+  → 接受并输出到角色（Proscenium Motion Bridge 0.9.2）
   → 独立 RETARGET Action
   → BA Workflow CLEAN / CORR
 ```
@@ -54,7 +54,9 @@ BlendCap Motion Bridge 针对常见 BVH：`LeftUpLeg=大腿`、`LeftLeg=小腿`�
 - `目标 Rest Pose`：将映射主体骨的 Matrix Basis 归零；
 - `指定 Action 帧`：从用户选择的目标 Action 与帧号读取初始姿态，不修改该 Action。
 
-静置帧与过渡帧均可设为 0–1000。插件保持正式动作原首帧不动，把缓冲键写在首帧之前：静置段保持初始姿态，过渡段用 Smoothstep 与四元数 SLERP 逐帧进入正式首姿。裙骨、发骨等非映射次级骨不会被写关键帧。
+“缓冲帧”是正式动作首帧之前的负帧总边距，可设为 0–1000；“过渡帧”包含在缓冲帧内，而不是额外相加。插件会把缓冲尾部用于 Smoothstep 与四元数 SLERP 过渡，前面的剩余帧保持初始姿态；若过渡帧大于缓冲帧，则按缓冲帧截断，因此实际静置帧数为 `缓冲帧 - min(缓冲帧, 过渡帧)`。例如缓冲 30、过渡 20 时，负帧总边距是 30 帧，其中前 10 帧静置、后 20 帧过渡。裙骨、发骨等非映射次级骨不会被写关键帧。
+
+从 0.9.1 或更早版本打开旧工程时，插件会把旧“静置帧 + 过渡帧”的实际总长度自动迁移为新的“缓冲帧”，因此原负帧范围不会在升级后缩短。
 
 Action 的自定义正式范围仍从真正首帧开始，因此 NLA 和导出不会包含边距；预滚动关键帧保留在范围之外，供刚体从非穿模状态顺序求值。Blender 5.1 的场景起点硬限制为 0，因此插件会自动启用可为负值的 Preview Range，把预览起点和未烘焙 Rigid Body World 缓存起点设为负的预滚动起点，逐帧求值后把当前帧停在那里。MMD Tools 烘焙直接读取刚体缓存起点，因此可从负帧正确开始；恢复角色原状态时会还原原时间轴、Preview Range 与缓存起点。
 

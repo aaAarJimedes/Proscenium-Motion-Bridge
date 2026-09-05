@@ -169,10 +169,19 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
                 buffer.label(text="初始姿态 Action")
                 buffer.prop(settings, "initial_pose_action", text="")
                 buffer.prop(settings, "initial_pose_frame")
-            buffer.prop(settings, "settle_frames")
+            buffer.prop(settings, "buffer_frames")
             buffer.prop(settings, "transition_frames")
             buffer.prop(settings, "evaluate_physics_preroll")
-            _draw_wrapped(buffer, context, "正式动作首帧不移动；缓冲保存在首帧之前", icon="INFO")
+            buffer_frames = max(0, int(settings.buffer_frames))
+            transition_frames = min(buffer_frames, max(0, int(settings.transition_frames)))
+            settle_frames = buffer_frames - transition_frames
+            _draw_wrapped(
+                buffer,
+                context,
+                f"负帧总边距 {buffer_frames} 帧：静置 {settle_frames} 帧 + 过渡 {transition_frames} 帧",
+                icon="INFO",
+            )
+            _draw_wrapped(buffer, context, "正式动作首帧不移动；过渡帧包含在缓冲帧内", icon="TIME")
             _draw_wrapped(buffer, context, "自动显示负帧预览范围，并停在缓冲起点", icon="TIME")
 
         mapping = layout.box()
