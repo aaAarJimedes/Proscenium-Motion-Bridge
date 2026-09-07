@@ -6,6 +6,7 @@ import math
 import bpy
 from mathutils import Matrix, Quaternion, Vector
 
+from .action_access import _iter_action_fcurves
 from .mapping import MappingResult
 
 
@@ -771,28 +772,3 @@ def bake_retarget(
     )
 
 
-def _iter_action_fcurves(action):
-    legacy = getattr(action, "fcurves", None)
-    if legacy is not None:
-        yield from legacy
-        return
-    slots = list(getattr(action, "slots", ()) or ())
-    for layer in getattr(action, "layers", ()):
-        for strip in getattr(layer, "strips", ()):
-            channelbags = getattr(strip, "channelbags", None)
-            if channelbags is not None:
-                try:
-                    for channelbag in channelbags:
-                        yield from channelbag.fcurves
-                    continue
-                except TypeError:
-                    pass
-            channelbag_method = getattr(strip, "channelbag", None)
-            if callable(channelbag_method):
-                for slot in slots:
-                    try:
-                        channelbag = channelbag_method(slot)
-                    except Exception:
-                        channelbag = None
-                    if channelbag is not None:
-                        yield from channelbag.fcurves

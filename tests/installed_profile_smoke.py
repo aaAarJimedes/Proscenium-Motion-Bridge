@@ -28,12 +28,12 @@ if state != (True, True):
 
 module = importlib.import_module(module_name)
 constants = importlib.import_module(module_name + ".constants")
-if tuple(constants.ADDON_VERSION) != (0, 9, 1):
+if tuple(constants.ADDON_VERSION) != (0, 10, 0):
     raise RuntimeError(f"Unexpected runtime version: {constants.ADDON_VERSION}")
 
 manifest_path = Path(module.__file__).resolve().parent / "blender_manifest.toml"
 manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
-if manifest.get("version") != "0.9.1":
+if manifest.get("version") != "0.10.0":
     raise RuntimeError(f"Unexpected installed manifest version: {manifest.get('version')}")
 
 if not hasattr(bpy.types.Scene, "ba_motion_bridge_settings"):

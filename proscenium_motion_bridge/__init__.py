@@ -7,9 +7,8 @@ from . import operators, panels, properties
 if _needs_reload:
     import importlib
 
-    properties = importlib.reload(properties)
-    operators = importlib.reload(operators)
-    panels = importlib.reload(panels)
+    for name in ['constants', 'mapping', 'action_access', 'rig_state', 'preroll', 'retarget', 'properties', 'operators', 'panels']:
+        importlib.reload(importlib.import_module("." + name, __package__))
 
 
 def register():

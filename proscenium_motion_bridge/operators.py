@@ -1,5 +1,36 @@
 from __future__ import annotations
 
+from .preroll import (
+    _physics_cache_snapshot,
+    _timeline_snapshot,
+    _restore_timeline_snapshot,
+    _restore_saved_timeline,
+    _extend_preroll_timeline,
+    _restore_physics_cache_snapshot,
+    _restore_saved_physics_cache,
+    _evaluate_physics_preroll,
+)
+
+from .action_access import (
+    _action_slot,
+    _action_slot_identifier,
+    _find_action_slot,
+    _bind_action,
+    _iter_action_fcurves,
+)
+
+from .rig_state import (
+    _constraint_by_identity,
+    _restore_constraint_rows,
+    _restore_saved_constraints,
+    _mapped_constraint_snapshot,
+    _disable_constraint_rows,
+    _target_switch_snapshot,
+    _restore_target_switch_rows,
+    _restore_saved_target_switches,
+    _force_target_fk_switches,
+)
+
 import hashlib
 import json
 import re
@@ -491,201 +522,7 @@ def _safe_action_name(value: str) -> str:
     return cleaned[:48] or "MMD"
 
 
-def _constraint_by_identity(target, row: dict):
-    pose_bone = target.pose.bones.get(row.get("owner", ""))
-    if pose_bone is None:
-        return None
-    constraint = pose_bone.constraints.get(row.get("constraint", ""))
-    if constraint is not None and row.get("type") and constraint.type != row["type"]:
-        return None
-    return constraint
-
-
-def _restore_constraint_rows(target, rows: list[dict]) -> tuple[int, int]:
-    restored = 0
-    missing = 0
-    for row in rows:
-        constraint = _constraint_by_identity(target, row)
-        if constraint is None:
-            missing += 1
-            continue
-        try:
-            constraint.mute = bool(row["mute"])
-            constraint.influence = float(row["influence"])
-            restored += 1
-        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
-            missing += 1
-    return restored, missing
-
-
-def _restore_saved_constraints(settings) -> tuple[int, int]:
-    if not settings.constraint_snapshot_json:
-        return 0, 0
-    try:
-        target = settings.constraint_snapshot_target_rig
-    except ReferenceError:
-        target = None
-    if target is None:
-        target = bpy.data.objects.get(settings.constraint_snapshot_target)
-    if target is None or target.type != "ARMATURE":
-        return 0, 1
-    try:
-        rows = json.loads(settings.constraint_snapshot_json)
-    except json.JSONDecodeError:
-        return 0, 1
-    if not isinstance(rows, list):
-        return 0, 1
-    restored, missing = _restore_constraint_rows(target, rows)
-    if missing == 0:
-        settings.constraint_snapshot_json = ""
-        settings.constraint_snapshot_target = ""
-        settings.constraint_snapshot_target_rig = None
-    return restored, missing
-
-
-def _mapped_constraint_snapshot(target, result: MappingResult) -> list[dict]:
-    by_role = {pair.role: pair.target for pair in result.pairs}
-    leg_roles = {
-        "left_thigh",
-        "left_shin",
-        "left_foot",
-        "right_thigh",
-        "right_shin",
-        "right_foot",
-    }
-    leg_bones = {by_role[role] for role in leg_roles if role in by_role}
-    hips = by_role.get("hips_rotation")
-
-    path_bones: set[str] = set()
-    for role in ("left_thigh", "right_thigh"):
-        current = by_role.get(role)
-        seen: set[str] = set()
-        while current and current not in seen:
-            path_bones.add(current)
-            if current == hips:
-                break
-            seen.add(current)
-            bone = target.data.bones.get(current)
-            current = bone.parent.name if bone and bone.parent else None
-
-    rows: list[dict] = []
-    for pose_bone in target.pose.bones:
-        for constraint in pose_bone.constraints:
-            selected = constraint.type == "IK" and pose_bone.name in leg_bones
-            if constraint.type == "TRANSFORM" and pose_bone.name in path_bones:
-                fingerprint = normalize(
-                    " ".join(
-                        (
-                            pose_bone.name,
-                            constraint.name,
-                            getattr(constraint, "subtarget", "") or "",
-                        )
-                    )
-                )
-                selected = any(
-                    token in fingerprint
-                    for token in ("cancel", "キャンセル", "腰キャンセル", "waist cancel", "waist_cancel")
-                )
-            if not selected:
-                continue
-            rows.append(
-                {
-                    "owner": pose_bone.name,
-                    "constraint": constraint.name,
-                    "type": constraint.type,
-                    "mute": bool(constraint.mute),
-                    "influence": float(constraint.influence),
-                }
-            )
-    return rows
-
-
-def _disable_constraint_rows(target, rows: list[dict]) -> int:
-    disabled = 0
-    for row in rows:
-        constraint = _constraint_by_identity(target, row)
-        if constraint is None:
-            continue
-        if not constraint.mute and constraint.influence > 1e-6:
-            disabled += 1
-        constraint.mute = True
-        constraint.influence = 0.0
-    return disabled
-
-
 _TARGET_SWITCH_KEYS = ("IK_FK", "ik_fk_switch")
-
-
-def _target_switch_snapshot(target) -> list[dict]:
-    """Capture rig-level FK/IK properties changed by the native bake setup."""
-    rows: list[dict] = []
-    for pose_bone in target.pose.bones:
-        for key in _TARGET_SWITCH_KEYS:
-            if key not in pose_bone.keys():
-                continue
-            value = pose_bone[key]
-            if not isinstance(value, (bool, int, float)):
-                continue
-            rows.append({"owner": pose_bone.name, "key": key, "value": float(value)})
-    return rows
-
-
-def _restore_target_switch_rows(target, rows: list[dict]) -> tuple[int, int]:
-    restored = 0
-    missing = 0
-    for row in rows:
-        pose_bone = target.pose.bones.get(row.get("owner", ""))
-        key = row.get("key", "")
-        if pose_bone is None or key not in pose_bone.keys():
-            missing += 1
-            continue
-        try:
-            pose_bone[key] = float(row["value"])
-            restored += 1
-        except (KeyError, RuntimeError, TypeError, ValueError):
-            missing += 1
-    try:
-        bpy.context.view_layer.update()
-    except (AttributeError, RuntimeError):
-        pass
-    return restored, missing
-
-
-def _restore_saved_target_switches(settings, target) -> tuple[int, int]:
-    if not settings.target_switch_snapshot_json:
-        return 0, 0
-    if settings.target_switch_snapshot_target and settings.target_switch_snapshot_target != target.name:
-        return 0, 1
-    try:
-        rows = json.loads(settings.target_switch_snapshot_json)
-    except json.JSONDecodeError:
-        return 0, 1
-    if not isinstance(rows, list):
-        return 0, 1
-    restored, missing = _restore_target_switch_rows(target, rows)
-    if missing == 0:
-        settings.target_switch_snapshot_json = ""
-        settings.target_switch_snapshot_target = ""
-    return restored, missing
-
-
-def _force_target_fk_switches(target) -> int:
-    changed = 0
-    for pose_bone in target.pose.bones:
-        for key in _TARGET_SWITCH_KEYS:
-            if key not in pose_bone.keys():
-                continue
-            try:
-                if abs(float(pose_bone[key]) - 1.0) > 1e-6:
-                    pose_bone[key] = 1.0
-                    changed += 1
-            except (RuntimeError, TypeError, ValueError):
-                pass
-    try:
-        bpy.context.view_layer.update()
-    except (AttributeError, RuntimeError):
-        pass
-    return changed
 
 
 _DIRECTION_ALIGNED_ROLES = frozenset(
@@ -788,81 +625,6 @@ def _activate_target(context, target) -> None:
         context.view_layer.objects.active = target
     except (AttributeError, RuntimeError):
         pass
-
-
-def _iter_action_fcurves(action):
-    legacy = getattr(action, "fcurves", None)
-    if legacy is not None:
-        yield from legacy
-        return
-    slots = list(getattr(action, "slots", ()) or ())
-    for layer in getattr(action, "layers", ()):
-        for strip in getattr(layer, "strips", ()):
-            yielded = False
-            channelbags = getattr(strip, "channelbags", None)
-            if channelbags is not None:
-                try:
-                    for channelbag in channelbags:
-                        yield from channelbag.fcurves
-                        yielded = True
-                except TypeError:
-                    yielded = False
-            if yielded:
-                continue
-            channelbag_method = getattr(strip, "channelbag", None)
-            if callable(channelbag_method):
-                for slot in slots:
-                    try:
-                        channelbag = channelbag_method(slot)
-                    except Exception:
-                        channelbag = None
-                    if channelbag is not None:
-                        yield from channelbag.fcurves
-                        yielded = True
-            if yielded:
-                continue
-            strip_fcurves = getattr(strip, "fcurves", None)
-            if strip_fcurves is not None:
-                yield from strip_fcurves
-
-
-def _action_slot(animation_data):
-    if not hasattr(animation_data, "action_slot"):
-        return None
-    try:
-        return animation_data.action_slot
-    except (AttributeError, RuntimeError):
-        return None
-
-
-def _action_slot_identifier(slot) -> str:
-    if slot is None:
-        return ""
-    try:
-        return str(slot.identifier)
-    except (AttributeError, ReferenceError, RuntimeError):
-        return ""
-
-
-def _find_action_slot(action, identifier: str):
-    if action is None or not identifier:
-        return None
-    for slot in getattr(action, "slots", ()):
-        if _action_slot_identifier(slot) == identifier:
-            return slot
-    return None
-
-
-def _bind_action(animation_data, action, preferred_slot=None) -> None:
-    animation_data.action = action
-    if action is None or not hasattr(animation_data, "action_slot"):
-        return
-    if preferred_slot is not None:
-        try:
-            animation_data.action_slot = preferred_slot
-            return
-        except (AttributeError, RuntimeError, TypeError):
-            pass
 
 
 def _mapped_target_channels(result: MappingResult) -> tuple[set[str], set[str]]:
@@ -1035,149 +797,6 @@ def _insert_start_buffer(
         "preroll_start": preroll_start,
         "inserted_frames": total_frames,
     }
-
-
-def _physics_cache_snapshot(scene) -> dict:
-    rigidbody_world = getattr(scene, "rigidbody_world", None)
-    point_cache = getattr(rigidbody_world, "point_cache", None)
-    if point_cache is None:
-        return {"present": False}
-    return {
-        "present": True,
-        "frame_start": int(point_cache.frame_start),
-    }
-
-
-def _timeline_snapshot(scene) -> dict:
-    return {
-        "frame_start": int(scene.frame_start),
-        "frame_current": int(scene.frame_current),
-        "use_preview_range": bool(scene.use_preview_range),
-        "frame_preview_start": int(scene.frame_preview_start),
-        "frame_preview_end": int(scene.frame_preview_end),
-    }
-
-
-def _restore_timeline_snapshot(scene, snapshot: dict) -> bool:
-    if not snapshot or "frame_start" not in snapshot:
-        return False
-    scene.frame_start = int(snapshot["frame_start"])
-    scene.use_preview_range = bool(snapshot.get("use_preview_range", scene.use_preview_range))
-    if "frame_preview_start" in snapshot:
-        scene.frame_preview_start = int(snapshot["frame_preview_start"])
-    if "frame_preview_end" in snapshot:
-        scene.frame_preview_end = int(snapshot["frame_preview_end"])
-    scene.frame_set(int(snapshot.get("frame_current", scene.frame_start)))
-    bpy.context.view_layer.update()
-    return True
-
-
-def _restore_saved_timeline(scene, settings) -> str:
-    if not settings.timeline_snapshot_json:
-        return "NONE"
-    try:
-        snapshot = json.loads(settings.timeline_snapshot_json)
-    except json.JSONDecodeError:
-        return "INVALID"
-    restored = _restore_timeline_snapshot(scene, snapshot)
-    settings.timeline_snapshot_json = ""
-    return "RESTORED" if restored else "SKIPPED"
-
-
-def _extend_preroll_timeline(scene, preroll_start: int) -> dict:
-    preroll_start = int(preroll_start)
-    # Scene.frame_start is hard-clamped to 0 by Blender 5.1.  A negative
-    # preview range is not clamped, remains draggable in the Timeline, and the
-    # rigid-body point cache independently accepts the same negative start.
-    scene.frame_start = min(int(scene.frame_start), preroll_start)
-    scene.use_preview_range = True
-    scene.frame_preview_start = min(int(scene.frame_preview_start), preroll_start)
-    scene.frame_preview_end = max(int(scene.frame_preview_end), int(scene.frame_end))
-    rigidbody_world = getattr(scene, "rigidbody_world", None)
-    point_cache = getattr(rigidbody_world, "point_cache", None)
-    cache_status = "NO_RIGID_BODY_WORLD"
-    if point_cache is not None:
-        if bool(getattr(point_cache, "is_baked", False)):
-            cache_status = "BAKED_CACHE"
-        else:
-            point_cache.frame_start = min(int(point_cache.frame_start), preroll_start)
-            cache_status = "EXTENDED"
-    scene.frame_set(preroll_start)
-    bpy.context.view_layer.update()
-    return {
-        "timeline_start": preroll_start,
-        "scene_start": int(scene.frame_start),
-        "cache_status": cache_status,
-    }
-
-
-def _restore_physics_cache_snapshot(scene, snapshot: dict) -> bool:
-    if not snapshot or not snapshot.get("present"):
-        return False
-    rigidbody_world = getattr(scene, "rigidbody_world", None)
-    point_cache = getattr(rigidbody_world, "point_cache", None)
-    if point_cache is None or bool(getattr(point_cache, "is_baked", False)):
-        return False
-    point_cache.frame_start = int(snapshot["frame_start"])
-    return True
-
-
-def _restore_saved_physics_cache(scene, settings) -> str:
-    if not settings.physics_cache_snapshot_json:
-        return "NONE"
-    try:
-        snapshot = json.loads(settings.physics_cache_snapshot_json)
-    except json.JSONDecodeError:
-        return "INVALID"
-    restored = _restore_physics_cache_snapshot(scene, snapshot)
-    settings.physics_cache_snapshot_json = ""
-    if restored:
-        return "RESTORED"
-    return "SKIPPED"
-
-
-def _evaluate_physics_preroll(
-    scene,
-    preroll_start: int,
-    motion_start: int,
-    progress=None,
-) -> dict:
-    timeline_result = _extend_preroll_timeline(scene, preroll_start)
-    rigidbody_world = getattr(scene, "rigidbody_world", None)
-    point_cache = getattr(rigidbody_world, "point_cache", None)
-    if point_cache is None:
-        if progress is not None:
-            progress(1.0, "未检测到刚体世界，已跳过物理预热")
-        return {"status": "NO_RIGID_BODY_WORLD", "evaluated_frames": 0}
-    if bool(getattr(point_cache, "is_baked", False)):
-        if progress is not None:
-            progress(1.0, "检测到已烘焙缓存，未覆盖")
-        return {"status": "BAKED_CACHE", "evaluated_frames": 0}
-
-    evaluated = 0
-    total_frames = max(1, int(motion_start) - int(preroll_start) + 1)
-    for frame in range(int(preroll_start), int(motion_start) + 1):
-        scene.frame_set(frame)
-        bpy.context.view_layer.update()
-        evaluated += 1
-        if progress is not None:
-            progress(
-                evaluated / total_frames,
-                f"预热物理帧 {frame}/{motion_start}",
-            )
-    scene.frame_set(preroll_start)
-    bpy.context.view_layer.update()
-    return {
-        "status": "EVALUATED",
-        "evaluated_frames": evaluated,
-        "timeline_start": timeline_result["timeline_start"],
-    }
-    suitable = list(getattr(animation_data, "action_suitable_slots", ()) or ())
-    if suitable:
-        try:
-            animation_data.action_slot = suitable[0]
-        except (AttributeError, RuntimeError, TypeError):
-            pass
 
 
 def _sample_nla_to_temporary_action(scene, source, state: dict, progress=None):
