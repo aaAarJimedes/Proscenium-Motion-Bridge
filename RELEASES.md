@@ -1,11 +1,15 @@
 # 0.10.0
 
-- Split plan compilation, rig state restoration, Action slot access and physics pre-roll into explicit modules, with compatibility imports retained.
-- Fix dead fallback slot selection previously placed after the pre-roll function return. Bind a preferred/matching/single slot, and roll back ambiguous multi-slot assignments.
-- Preserve the reverted 0.9.1 settle + transition buffer behavior, formal first-frame keys, placement, guard strength and FK/IK recovery.
-- Add BA prop contact/release baking with isolated Actions and restoration, and read-only low-speed/velocity diagnostics.
-- Keep one prompt per Clip; reject pasted control-document wrappers and show the 1000-character limit and exact scene FPS duration.
-- Regression coverage: prop transform accuracy and restore, multi-slot rollback, fractional FPS metadata, rotated placement, adjustable arm guard, first-frame buffer, paired seam idempotence/mode switch/failure rollback and planted-foot reuse.
+Proscenium Motion Bridge 0.10.0：重定向内部结构整理与 Action 槽位修复。
+
+- 拆分骨架状态恢复、Action 槽位访问和物理预滚动模块；操作符与重定向共享曲线访问代码。
+- 修复原有备用槽位绑定代码不可达的问题。多个无法明确区分的兼容槽位会回滚并提示选择，避免静默绑定错误动作。
+- 保留 0.9.1 的静置帧 + 过渡帧缓冲规则、目标放置空间和末端保护默认值。
+
+Blender 5.1.2 验证通过：实际用户配置加载、目标角色切换、根运动空间、末端保护和缓冲语义回归。与 BA Animation Workflow 0.10.0 联合验证通过。
+
+安装 proscenium_motion_bridge-0.10.0.zip；不要使用 GitHub 的 Source code ZIP 安装。
+
 
 # Release archive
 
@@ -13,6 +17,7 @@
 
 | Tag | Release asset | Bytes | SHA256 |
 | --- | --- | ---: | --- |
+| `v0.10.0` | `proscenium_motion_bridge-0.10.0.zip` | 43,173 | `9abb0438fd66f57ef74fb38f7c293b77b699a1e3c0864c68461b27c1eb615954` |
 | `v0.1.0` | `ba_motion_bridge-0.1.0.zip` | 19,347 | `60dfc5f602a21f886c4ff0951c1f40447c128bd5d8da71bb54174f1ca7240ab6` |
 | `v0.2.0` | `ba_motion_bridge-0.2.0.zip` | 24,473 | `b6b72edd51a6a092cc924c6d8b1ad329e8c07bf0eb09bc4dece9a0818b610d5a` |
 | `v0.3.1` | `proscenium_motion_bridge-0.3.1.zip` | 27,597 | `81ca536bb76cc5424baa8a370f21963cd62b2aa6b099b76dab62b753091d6bae` |
