@@ -1698,7 +1698,41 @@ class BAM_OT_cleanup_temporary(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class BAM_OT_measure_chibi_reach(bpy.types.Operator):
+    bl_idname = "ba_motion_bridge.measure_chibi_reach"
+    bl_label = "测量 MMD 手臂与接触范围"
+    bl_description = "按当前姿态与世界缩放测量手臂，生成接触规划报告；不改动姿态或动画"
+
+    def execute(self, context):
+        from .proportion import measure_arm
+        target = context.scene.ba_motion_bridge_settings.target_rig
+        if target is None or target.type != 'ARMATURE':
+            self.report({'ERROR'}, '请先选择角色目标骨架')
+            return {'CANCELLED'}
+        context.view_layer.update()
+        rows = {}
+        try:
+            for side in ('R', 'L'):
+                profile = measure_arm(target, '腕.'+side, 'ひじ.'+side, '手首.'+side)
+                rows[side] = dict(shoulder=profile.shoulder,
+                                 upper_length=profile.upper_length,
+                                 forearm_length=profile.forearm_length,
+                                 hand_length=profile.hand_length,
+                                 maximum_wrist_reach=profile.maximum)
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        name = 'Motion Bridge Reach - '+target.name
+        text = bpy.data.texts.get(name) or bpy.data.texts.new(name)
+        text.clear()
+        text.write(json.dumps(dict(target=target.name, frame=context.scene.frame_current,
+                                   units='Blender world units', arms=rows), ensure_ascii=False, indent=2))
+        self.report({'INFO'}, f"测量已写入文本：{name}；未改变动画")
+        return {'FINISHED'}
+
+
 CLASSES = (
+    BAM_OT_measure_chibi_reach,
     BAM_OT_prepare_from_proscenium,
     BAM_OT_auto_map,
     BAM_OT_validate_mapping,

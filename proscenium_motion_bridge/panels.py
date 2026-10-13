@@ -91,6 +91,8 @@ class BAM_PT_proscenium_motion_bridge(bpy.types.Panel):
         rigs.prop(settings, "source_rig", text="")
         rigs.label(text="角色目标骨架")
         rigs.prop(settings, "target_rig", text="")
+        rigs.operator("ba_motion_bridge.measure_chibi_reach", text="测量 Q 版 / MMD 接触范围", icon="DRIVER_DISTANCE")
+        rigs.operator("ba_motion_bridge.inspect_mmd_elbows", text="检查 Q 版肘关节（当前帧）", icon="CON_ROTLIMIT")
         source_ready = _is_official_source(settings.source_rig)
         target_ready = _live_armature(settings.target_rig) and settings.target_rig != settings.source_rig
         rigs.label(

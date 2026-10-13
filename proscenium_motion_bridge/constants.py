@@ -1,4 +1,4 @@
-ADDON_VERSION = (0, 10, 0)
+ADDON_VERSION = (0, 10, 2)
 
 TOOL_ID = "proscenium_motion_bridge"
 TOOL_NAME = "Proscenium Motion Bridge"

@@ -28,13 +28,14 @@ if state != (True, True):
 
 module = importlib.import_module(module_name)
 constants = importlib.import_module(module_name + ".constants")
-if tuple(constants.ADDON_VERSION) != (0, 10, 0):
-    raise RuntimeError(f"Unexpected runtime version: {constants.ADDON_VERSION}")
-
 manifest_path = Path(module.__file__).resolve().parent / "blender_manifest.toml"
 manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
-if manifest.get("version") != "0.10.0":
-    raise RuntimeError(f"Unexpected installed manifest version: {manifest.get('version')}")
+source_manifest = Path(__file__).resolve().parents[1] / 'proscenium_motion_bridge' / 'blender_manifest.toml'
+expected_version = tomllib.loads(source_manifest.read_text(encoding='utf-8'))['version']
+if manifest['version'] != expected_version:
+    raise RuntimeError(f"Installed version {manifest['version']} differs from source {expected_version}")
+if tuple(constants.ADDON_VERSION) != tuple(int(part) for part in manifest['version'].split('.')):
+    raise RuntimeError(f"Runtime/manifest version mismatch: {constants.ADDON_VERSION}, {manifest['version']}")
 
 if not hasattr(bpy.types.Scene, "ba_motion_bridge_settings"):
     raise RuntimeError("Scene settings were not registered")

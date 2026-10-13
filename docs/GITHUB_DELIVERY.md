@@ -8,6 +8,10 @@ Use local git and gh with the existing user authentication. Inspect the reposito
 
 ## Releases
 
+The main branch contains 0.10.2 development source, including the 0.10.1 contact-planning helper. The downloadable stable release remains v0.10.0. This source synchronization is not a 0.10.2 release, tag, package replacement, or installation update.
+
+Before promoting the development source, verify installation and enabled-profile behavior with the matching packaged version, then review representative real-model poses and continuous motion, including shoulder/wrist motion, skinning and prop contact. The elbow diagnostic requires a calibrated local -Z flexion axis; factory-scene regression tests do not establish universal rig support. Earlier three-model acceptance notes are historical evidence, not a fresh full-scene acceptance run.
+
 The maintained release page uses v0.10.0 as its tag. Later validated versions may take over the page only after its complete version history, notes, and downloadable assets have been migrated.
 
 Put current downloads first, followed by historical versions from newest to oldest. Each historical layer retains its original release notes, version identity, and real downloadable assets. Keep original Git tags for source history. Download and verify the actual bytes before retiring old pages; page titles and catalogs alone do not count as asset migration.

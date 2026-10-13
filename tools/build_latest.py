@@ -1,12 +1,18 @@
 """Build a deterministic Blender extension archive from this repository."""
 from pathlib import Path
-import tomllib,zipfile,hashlib,json
+import argparse,tomllib,zipfile,hashlib,json
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--output-dir',type=Path,help='Override the delivery directory for isolated build checks')
+args=parser.parse_args()
 root=Path(__file__).resolve().parents[1]
 candidates=[p for p in [root/'extension/ba_animation_workflow/blender_manifest.toml',root/'proscenium_motion_bridge/blender_manifest.toml'] if p.exists()]
 if len(candidates)!=1:raise RuntimeError('Expected one maintained extension manifest')
 manifest=candidates[0];folder=manifest.parent
 meta=tomllib.loads(manifest.read_text(encoding='utf8'))
-dist=root/'dist';dist.mkdir(exist_ok=True)
+workspace=next((p for p in root.parents if (p/'Agent Delivery').is_dir() and (p/'Agent Tools').is_dir()),None)
+dist=args.output_dir if args.output_dir is not None else (workspace/'Agent Delivery'/'Motion_Bridge'/'Proscenium' if workspace else root/'dist')
+if dist.resolve().is_relative_to(folder.resolve()):raise ValueError('Build output must be outside the extension source directory')
+dist.mkdir(parents=True,exist_ok=True)
 archive=dist/(meta['id']+'-'+meta['version']+'.zip');hashes={}
 with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
     for p in sorted(folder.rglob('*')):
