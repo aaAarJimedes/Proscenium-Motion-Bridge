@@ -32,7 +32,9 @@ Blender 扩展，用于把 Proscenium / Animatica 标准骨架动作重定向到
 
 当前插件源码位于 `proscenium_motion_bridge/`。版本清单与发布资产哈希见 `RELEASES.md`。
 
-`tools/build_latest.py` 在本工作区默认输出到 `Agent Delivery/Motion_Bridge/Proscenium/`，外部检出默认输出到 `dist/`；可用 `--output-dir` 指定独立验证目录。构建开发包不会自动发布。
+动作提示词技能维护在 [skills/proscenium-prompt-writing](skills/proscenium-prompt-writing/SKILL.md)，可与插件配合使用；该技能不包含在 Blender 扩展安装包中。
+
+`tools/build_latest.py` 在本工作区默认输出到 `项目/Motion_Bridge/成果/Proscenium/`，外部检出默认输出到 `dist/`；可用 `--output-dir` 指定独立验证目录。构建开发包不会自动发布。
 
 回归测试使用 Blender 5.1+ 的独立工厂场景。分别设置对应环境变量为 `isolated-factory-test`，再运行 `blender --background --factory-startup --python-exit-code 1 --python <脚本>`：
 

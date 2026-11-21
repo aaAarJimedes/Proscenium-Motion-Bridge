@@ -9,8 +9,8 @@ candidates=[p for p in [root/'extension/ba_animation_workflow/blender_manifest.t
 if len(candidates)!=1:raise RuntimeError('Expected one maintained extension manifest')
 manifest=candidates[0];folder=manifest.parent
 meta=tomllib.loads(manifest.read_text(encoding='utf8'))
-workspace=next((p for p in root.parents if (p/'Agent Delivery').is_dir() and (p/'Agent Tools').is_dir()),None)
-dist=args.output_dir if args.output_dir is not None else (workspace/'Agent Delivery'/'Motion_Bridge'/'Proscenium' if workspace else root/'dist')
+workspace=next((p for p in root.parents if (p/'源码').is_dir() and (p/'成果').is_dir()),None)
+dist=args.output_dir if args.output_dir is not None else (workspace/'成果'/'Proscenium' if workspace else root/'dist')
 if dist.resolve().is_relative_to(folder.resolve()):raise ValueError('Build output must be outside the extension source directory')
 dist.mkdir(parents=True,exist_ok=True)
 archive=dist/(meta['id']+'-'+meta['version']+'.zip');hashes={}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Proscenium Prompt Writing"
+  short_description: "Write concise Proscenium prompts within 1000 characters"
+  default_prompt: "Use $proscenium-prompt-writing to turn my action idea into copy-ready Proscenium prompts, adding frame blocks and spatial-control notes only when needed. Verify every submitted prompt is within 1000 characters."
